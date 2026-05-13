@@ -393,12 +393,26 @@ class NewTaskRequestImage(NewTaskRequest):
     model_repo: str = Field(..., description="The model repository to use")
     image_text_pairs: list[ImageTextPair] = Field(
         ...,
-        description="List of image and text file pairs",
+        description="List of image and text file URL pairs",
         min_length=cst.MIN_IMAGE_TEXT_PAIRS,
         max_length=cst.MAX_IMAGE_TEXT_PAIRS,
     )
     ds_id: str = Field(
-        default_factory=lambda: str(uuid4()), description="A ds name. The actual dataset is provided via the image_text_pairs"
+        default_factory=lambda: str(uuid4()),
+        description="A ds name. The actual dataset is provided via the image_text_pairs",
+    )
+    model_type: ImageModelType = ImageModelType.SDXL
+
+
+class NewTaskRequestImageZip(NewTaskRequest):
+    model_config = ConfigDict(protected_namespaces=())
+    model_repo: str = Field(..., description="The model repository to use")
+    ds: str = Field(
+        ...,
+        description=(
+            "Public or presigned URL to a zip file containing image files and matching .txt caption files. "
+            "Each image and caption must share the same filename stem."
+        ),
     )
     model_type: ImageModelType = ImageModelType.SDXL
 
@@ -537,7 +551,8 @@ class EnvironmentTaskDetails(TaskDetails):
 
 class ImageTaskDetails(TaskDetails):
     task_type: TaskType = TaskType.IMAGETASK
-    image_text_pairs: list[ImageTextPair]
+    image_text_pairs: list[ImageTextPair] | None = None
+    ds_repo: str | None = None
     base_model_repository: str = Field(..., description="The repository for the model")
     model_type: ImageModelType = ImageModelType.SDXL
 

@@ -1,5 +1,6 @@
 import random
 
+from core.constants import EnvironmentName
 from core.models.tournament_models import GroupRound
 from core.models.tournament_models import KnockoutRound
 from core.models.tournament_models import Round
@@ -111,7 +112,7 @@ async def _create_environment_group_tasks(
 
     logger.info(f"Creating {expected_task_count - len(existing_tasks)} environment task(s) for all participants")
 
-    force_env: str | None = None
+    force_env: EnvironmentName | None = None
     if is_final_round and expected_task_count == 1 and t_cst.FORCED_BOSS_ENVIRONMENT:
         force_env = t_cst.FORCED_BOSS_ENVIRONMENT
         logger.info(f"Final round: forcing boss environment to {force_env}")
@@ -150,10 +151,10 @@ async def _create_environment_group_tasks(
     return tasks
 
 
-async def _get_previous_round_environment_names(tournament_id: str, config: Config) -> list[str]:
+async def _get_previous_round_environment_names(tournament_id: str, config: Config) -> list[EnvironmentName]:
     """Look up the environment_names used in all prior rounds, so we don't repeat games."""
     rounds = await get_tournament_rounds(tournament_id, config.psql_db)
-    env_names: list[str] = []
+    env_names: list[EnvironmentName] = []
     for round_data in rounds:
         tasks = await get_tournament_tasks(round_data.round_id, config.psql_db)
         if tasks:

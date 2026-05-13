@@ -1,8 +1,12 @@
 import os
 from datetime import date
 
+from core.constants import EnvironmentName
 from core.constants import GRPO_DEFAULT_FIELD_PROMPT
 from core.constants import NETUID
+from core.models.model_prep_models import AugmentationScope
+from core.models.model_prep_models import AugmentationType
+from core.models.utility_models import TaskType
 
 
 RAYONLABS_HF_USERNAME = "gradients-io-tournaments"  # "besimray"  # "rayonlabs"
@@ -298,6 +302,7 @@ STANDARD_CHAT_MESSAGES_COLUMN = "conversations"
 # Trainer endpoints
 
 PROXY_TRAINING_IMAGE_ENDPOINT = "/v1/trainer/start_training"
+MODEL_PREP_ENDPOINT = "/v1/trainer/model_prep"
 GET_GPU_AVAILABILITY_ENDPOINT = "/v1/trainer/get_gpu_availability"
 TASK_DETAILS_ENDPOINT = "/v1/trainer/{task_id}"
 GET_RECENT_TASKS_ENDPOINT = "/v1/trainer/get_recent_tasks"
@@ -321,60 +326,58 @@ YARN_EXTENSION_PROBABILITY = 0.0  # Probability of applying YaRN extension to to
 YARN_TOURNAMENT_FACTORS = [2, 4]
 MODEL_COPY_ENDPOINT = "https://huggingface.co/api/models/{source_repo}/duplicate"
 
+# Model prep constants
+BASELINE_STATS_ENABLED_ORGANIC = False  # Run model prep (stats) for organic requests
+MODEL_PREP_ENABLED_TEXT = True  # Route text tasks through model prep (augmentation + baseline stats)
+MODEL_PREP_ENABLED_IMAGE = False  # Route image tasks through model prep
+MODEL_PREP_ENABLED_ENV = False  # Route environment tasks through model prep
+MODEL_PREP_ENABLED_BY_TASK_TYPE: dict[TaskType, bool] = {
+    TaskType.INSTRUCTTEXTTASK: MODEL_PREP_ENABLED_TEXT,
+    TaskType.DPOTASK: MODEL_PREP_ENABLED_TEXT,
+    TaskType.GRPOTASK: MODEL_PREP_ENABLED_TEXT,
+    TaskType.CHATTASK: MODEL_PREP_ENABLED_TEXT,
+    TaskType.IMAGETASK: MODEL_PREP_ENABLED_IMAGE,
+    TaskType.ENVIRONMENTTASK: MODEL_PREP_ENABLED_ENV,
+}
+
+# Model augmentation constants
+AUGMENTATION_ENABLED_TEXT = True  # Enable augmentations for text tasks
+AUGMENTATION_ENABLED_IMAGE = False  # Enable augmentations for image tasks
+AUGMENTATION_ENABLED_ENV = False  # Enable augmentations for environment tasks
+AUGMENTATION_PROBABILITY = 0.5  # Probability that a task gets any augmentation at all
+
+# Weighted distribution over augmentation types (normalised at runtime)
+# When an augmentation is applied, one type is chosen according to these weights
+AUGMENTATION_TYPE_WEIGHTS: dict[AugmentationType, float] = {
+    AugmentationType.GAUSSIAN_NOISE: 0.35,
+    AugmentationType.WEIGHT_SCALING: 0.30,
+    AugmentationType.MAGNITUDE_PRUNING: 0.25,
+    AugmentationType.LAYER_REINIT: 0.10,
+}
+
+# Weighted distribution over layer scope (normalised at runtime)
+# Determines how many layers the augmentation targets
+AUGMENTATION_SCOPE_WEIGHTS: dict[AugmentationScope, float] = {
+    AugmentationScope.SINGLE_LAYER: 0.40,
+    AugmentationScope.LAYER_TYPE_GROUP: 0.30,
+    AugmentationScope.MULTI_LAYER: 0.20,
+    AugmentationScope.ALL_LAYERS: 0.10,
+}
+
+# Intensity ranges per augmentation type (min, max) — sampled uniformly
+AUGMENTATION_INTENSITY_RANGES: dict[AugmentationType, tuple[float, float]] = {
+    AugmentationType.GAUSSIAN_NOISE: (0.005, 0.02),
+    AugmentationType.WEIGHT_SCALING: (0.8, 1.2),
+    AugmentationType.MAGNITUDE_PRUNING: (0.05, 0.15),
+    AugmentationType.LAYER_REINIT: (0.01, 0.05),
+}
+
 # Environment evaluation constants
 ENV_SERVER_CMD_DEFAULT = "python -m uvicorn _affinetes.server:app --host 0.0.0.0 --port 8001 --workers 1 --loop asyncio"
 BASILICA_GPU_MODELS = ["A100"]
 BASILICA_SGLANG_MIN_GPU_MEMORY_GB = 80
 
-ENVIRONMENTS = {
-    "alfworld": {
-        "task_id_range": (1, 2500),
-        "num_seeds": 100,
-        "env_image": "affinefoundation/agentgym:alfworld",
-        "eval_payload_extra": {"max_round": 30},
-    },
-    "goofspiel": {
-        "task_id_range": (0, 99999999),
-        "num_seeds": 2000,
-        "env_image": "diagonalge/openspiel:latest",
-        "eval_payload_extra": {"opponent": "random", "api_key": "dummy-key"},
-    },
-    "gin_rummy": {
-        "task_id_range": (300000000, 399999999),
-        "num_seeds": 1000,
-        "env_image": "diagonalge/mcts-api:latest",
-        "eval_payload_extra": {
-            "opponent": "mcts",
-            "mcts_max_simulations": 50,
-            "mcts_num_rollouts": 1,
-            "api_key": "dummy-key",
-        },
-    },
-    "liars_dice": {
-        "task_id_range": (100000000, 199999999),
-        "num_seeds": 10000,
-        "env_image": "diagonalge/mcts-api:latest",
-        "eval_payload_extra": {
-            "opponent": "mcts",
-            "mcts_max_simulations": 225,
-            "mcts_num_rollouts": 1,
-            "api_key": "dummy-key",
-        },
-    },
-    "leduc_poker": {
-        "task_id_range": (200000000, 299999999),
-        "num_seeds": 2000,
-        "env_image": "diagonalge/mcts-api:latest",
-        "eval_payload_extra": {
-            "opponent": "mcts",
-            "mcts_max_simulations": 50,
-            "mcts_num_rollouts": 1,
-            "api_key": "dummy-key",
-        },
-    },
-}
-
-DEFAULT_ENV = "gin_rummy"
+DEFAULT_ENV = EnvironmentName.GIN_RUMMY
 ENV_EVAL_DEFAULT_SEED = 42
 ENV_EVAL_NUM_SEEDS = 2000
 ENV_EVAL_TEMPERATURE = 0.0

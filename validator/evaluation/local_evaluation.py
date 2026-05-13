@@ -266,18 +266,19 @@ async def run_evaluation_local_environment(
     raw_sglang_log_file = os.getenv("LOCAL_ENV_SGLANG_RAW_LOG_FILE", "").strip()
 
     env_name = dataset_type.environment_name
-    if env_name not in vcst.ENVIRONMENTS:
-        raise ValueError(f"Environment '{env_name}' not found. Supported: {list(vcst.ENVIRONMENTS.keys())}")
+    if env_name not in cst.ENVIRONMENT_CONFIGS:
+        raise ValueError(f"Environment '{env_name}' not found. Supported: {[e.value for e in cst.EnvironmentName]}")
 
-    env_config = vcst.ENVIRONMENTS[env_name]
-    task_id_min, task_id_max = env_config["task_id_range"]
+    env_config = cst.ENVIRONMENT_CONFIGS[env_name]
+    task_id_min = env_config.task_id_min
+    task_id_max = env_config.task_id_max
     num_seeds_override = os.getenv("ENV_EVAL_NUM_SEEDS", "").strip()
     if num_seeds_override:
         num_seeds = int(num_seeds_override)
     else:
-        num_seeds = env_config.get("num_seeds", vcst.ENV_EVAL_NUM_SEEDS)
-    env_image = env_config["env_image"]
-    env_payload_extra = env_config.get("eval_payload_extra", {})
+        num_seeds = env_config.num_seeds
+    env_image = env_config.env_image
+    env_payload_extra = env_config.eval_payload_extra
     temperature = float(os.getenv("ENV_EVAL_TEMPERATURE", str(vcst.ENV_EVAL_TEMPERATURE)))
 
     base_seed = eval_seed if eval_seed is not None else vcst.ENV_EVAL_DEFAULT_SEED

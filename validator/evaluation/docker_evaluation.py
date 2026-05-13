@@ -618,10 +618,10 @@ async def run_evaluation_basilica_text(
     }
     if is_environment_eval:
         env_name = dataset_type.environment_name
-        if env_name not in vcst.ENVIRONMENTS:
-            raise ValueError(f"Environment '{env_name}' not found. Supported: {list(vcst.ENVIRONMENTS.keys())}")
+        if env_name not in cst.ENVIRONMENT_CONFIGS:
+            raise ValueError(f"Environment '{env_name}' not found. Supported: {[e.value for e in cst.EnvironmentName]}")
         base_seed = eval_seed if eval_seed is not None else vcst.ENV_EVAL_DEFAULT_SEED
-        base_env["ENVIRONMENT_NAME"] = env_name
+        base_env["ENVIRONMENT_NAME"] = env_name.value
         base_env["EVAL_SEED"] = str(base_seed)
         base_env["ENV_EVAL_TEMPERATURE"] = str(vcst.ENV_EVAL_TEMPERATURE)
         base_env["ENV_SERVER_CMD"] = vcst.ENV_SERVER_CMD_DEFAULT

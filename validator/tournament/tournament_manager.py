@@ -75,6 +75,8 @@ from validator.tournament.utils import get_round_winners
 from validator.tournament.utils import notify_tournament_completed
 from validator.tournament.utils import notify_tournament_started
 from validator.tournament.utils import send_to_discord
+from validator.tournament.utils import deduplicate_by_github_account
+from validator.tournament.utils import validate_github_tokens
 from validator.tournament.utils import validate_repo_license
 from validator.tournament.utils import validate_repo_obfuscation
 from validator.utils.call_endpoint import process_non_stream_fiber_get
@@ -616,6 +618,15 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
                         logger.info(f"Node responded with training repo {result.github_repo}@{result.commit_hash}")
 
         logger.info(f"Got {len(responding_nodes)} responding nodes")
+
+        await validate_github_tokens(responding_nodes)
+
+        pre_dedup = len(responding_nodes)
+        responding_nodes = deduplicate_by_github_account(responding_nodes)
+        if len(responding_nodes) < pre_dedup:
+            logger.info(
+                f"Deduplicated GitHub accounts: {pre_dedup} -> {len(responding_nodes)} nodes"
+            )
 
         logger.info(f"Processing {len(responding_nodes)} responding nodes")
 

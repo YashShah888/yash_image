@@ -3,13 +3,17 @@
 import subprocess
 import tempfile
 from collections import Counter
+from collections import defaultdict
+from urllib.parse import urlparse
 from pathlib import Path
 
 import aiohttp
 import httpx
 import numpy as np
 
+from core.models.tournament_models import GitHubOwnerRepo
 from core.models.tournament_models import GpuRequirement
+from core.models.tournament_models import RespondingNode
 from core.models.tournament_models import RoundType
 from core.models.tournament_models import TournamentData
 from core.models.tournament_models import TournamentParticipant
@@ -1388,3 +1392,77 @@ async def validate_repo_license(repo_url: str, github_token: str | None = None) 
     except Exception as e:
         logger.error(f"Repository validation failed for repo {repo_url}: {str(e)}")
         return False
+
+
+def parse_github_owner_repo(repo_url: str) -> GitHubOwnerRepo | None:
+    path = urlparse(repo_url).path.strip("/")
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[0] and parts[1]:
+        owner, repo_name = parts[0], parts[1].removesuffix(".git")
+        return GitHubOwnerRepo(owner=owner, repo=repo_name)
+    return None
+
+
+async def validate_github_tokens(nodes: list[RespondingNode]) -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        for node in nodes:
+            token = node.training_repo_response.github_token
+            if not token:
+                continue
+
+            parsed = parse_github_owner_repo(node.training_repo_response.github_repo)
+            if not parsed:
+                node.training_repo_response.github_token = None
+                continue
+
+            try:
+                resp = await client.get(
+                    f"https://api.github.com/repos/{parsed.owner}/{parsed.repo}",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Token for {node.node.hotkey} does not grant access to "
+                        f"{parsed.owner}/{parsed.repo} (HTTP {resp.status_code}) — ignoring token"
+                    )
+                    node.training_repo_response.github_token = None
+            except Exception as e:
+                logger.warning(f"Token validation failed for {node.node.hotkey}: {e} — ignoring token")
+                node.training_repo_response.github_token = None
+
+
+def deduplicate_by_github_account(nodes: list[RespondingNode]) -> list[RespondingNode]:
+    by_account: defaultdict[str, list[RespondingNode]] = defaultdict(list)
+    no_account: list[RespondingNode] = []
+
+    for node in nodes:
+        parsed = parse_github_owner_repo(node.training_repo_response.github_repo)
+        if parsed:
+            by_account[parsed.owner.lower()].append(node)
+        else:
+            no_account.append(node)
+
+    kept: list[RespondingNode] = list(no_account)
+    for account, group in by_account.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+
+        with_token = [n for n in group if n.training_repo_response.github_token]
+        without_token = [n for n in group if not n.training_repo_response.github_token]
+
+        if with_token:
+            winner = with_token[0]
+            rejected = with_token[1:] + without_token
+        else:
+            winner = without_token[0]
+            rejected = without_token[1:]
+
+        kept.append(winner)
+        for r in rejected:
+            logger.warning(
+                f"Rejecting {r.node.hotkey} — duplicate GitHub account '{account}' "
+                f"(kept {winner.node.hotkey})"
+            )
+
+    return kept

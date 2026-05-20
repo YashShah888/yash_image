@@ -7,10 +7,10 @@ Edit the config constants below, then run:
 """
 
 import asyncio
-import subprocess
 import time
 
 from core.models.utility_models import EnvironmentDatasetType
+from core.models.utility_models import FileFormat
 from validator.evaluation.docker_evaluation import run_evaluation_basilica_text
 
 
@@ -37,6 +37,7 @@ async def run_evaluation() -> None:
         models=[model_to_eval],
         original_model=BASE_MODEL_NAME,
         dataset_type=dataset_type,
+        file_format=FileFormat.S3,
         num_gpus=NUM_GPUS,
         eval_seed=RANDOM_SEED,
     )

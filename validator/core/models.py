@@ -13,6 +13,8 @@ from pydantic import field_validator
 from pydantic import model_validator
 
 from core.constants import EnvironmentName
+from core.constants import TrainingStartPoint
+from core.models.scoring_models import EnvironmentWeight
 from core.constants import YARN_VALID_FACTORS
 from core.models.model_prep_models import AugmentationConfig
 from core.models.utility_models import Backend
@@ -114,6 +116,7 @@ class RawTask(BaseModel):
     augmentation_config: AugmentationConfig | None = None
     augmented_model_id: str | None = None
     baseline_stats: BaselineStats | None = None
+    training_start_point: TrainingStartPoint = TrainingStartPoint.DEFAULT
 
     # Turn off protected namespace for model
     model_config = ConfigDict(protected_namespaces=())
@@ -172,7 +175,8 @@ class EnvRawTask(RawTask):
     Environment task data as stored in the database. It expand the RawTask with fields from the EnvTask table.
     """
 
-    environment_name: EnvironmentName | None = None
+    environment_names: list[EnvironmentName] = []
+    environment_weights: list[EnvironmentWeight] = []
     eval_seed: int | None = None
     task_type: TaskType = TaskType.ENVIRONMENTTASK
     synthetic_data: str | None = None

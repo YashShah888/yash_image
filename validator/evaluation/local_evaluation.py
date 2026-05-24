@@ -299,7 +299,7 @@ async def run_evaluation_local_environment(
     stream_sglang_logs = os.getenv("LOCAL_ENV_STREAM_SGLANG_LOGS", "0").strip().lower() in {"1", "true", "yes", "on"}
     raw_sglang_log_file = os.getenv("LOCAL_ENV_SGLANG_RAW_LOG_FILE", "").strip()
 
-    env_name = dataset_type.environment_name
+    env_name = (dataset_type.environment_names or [None])[0]
     if env_name not in cst.ENVIRONMENT_CONFIGS:
         raise ValueError(f"Environment '{env_name}' not found. Supported: {[e.value for e in cst.EnvironmentName]}")
 

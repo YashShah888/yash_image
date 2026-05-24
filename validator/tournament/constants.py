@@ -33,6 +33,9 @@ DSTACK_TEXT_REGIONS = ["CA-MTL-1", "AP-JP-1", "US-KS-2", "US-GA-2", "US-CA-2", "
 
 # Trainer requests
 TRAINER_HTTP_TIMEOUT = 30.0  # seconds
+# Grace period after GPU reservation before trusting trainer "available" reports.
+# Covers the gap between dispatch and container startup (clone, docker build, etc).
+GPU_RESERVATION_GRACE_PERIOD_SECONDS = 10 * 60  # 10 minutes
 EXPECTED_TRAINING_START_MESSAGE = "Started Training!"
 NO_RETRY_RESULT = "No Retry"
 
@@ -42,19 +45,15 @@ MAX_NUMBER_OF_MINERS_FOR_KNOCKOUT_ROUND = 14
 EXPECTED_GROUP_SIZE = 32
 MIN_GROUP_SIZE = 20
 MIN_ENVIRONMENT_GROUP_SIZE = 2
-MAX_ENVIRONMENT_GROUP_SIZE = 6
+MAX_ENVIRONMENT_GROUP_SIZE = 4
 
 
 # Environment tournament round structure
-ENV_TOTAL_ROUNDS = 4  # R1, R2, R3 (pre-final gate), R4 (final)
-ENV_ROUND_1_ADVANCE_COUNT = 8
-ENV_ROUND_2_ADVANCE_COUNT = 2
-ENV_ROUND_3_CANDIDATE_COUNT = 2
-ENV_ADVANCE_PER_GROUP = 2
+ENV_ADVANCE_PER_GROUP = 1
 ENV_FINAL_ROUND_TASK_COUNT = 3
 ENV_ENVS_PER_ROUND_MULTIPLIER = 2  # R1=2, R2=4, R3=6 (capped at total available)
-ENV_TRAINING_HOURS_BY_ROUND: dict[int, float] = {1: 1.5, 2: 2.0, 3: 2.5, 4: 3.0}
-ENV_TRAINING_HOURS_DEFAULT = 3.0
+ENV_TRAINING_HOURS = 1.5
+ENV_TRAINING_HOURS_BOSS_ROUND_FROM_SCRATCH = 3.0
 ENV_TARGET_TOURN_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 # If set, forces this game to be the boss (final) round task and excludes it from earlier rounds.
 # Set to None to let any game randomly be the boss round.

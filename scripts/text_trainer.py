@@ -113,8 +113,7 @@ def create_config(task_id, model, dataset, dataset_type, file_format, output_dir
         config["trl"]["reward_funcs"] = [f"{filename}.{func_name}" for func_name in reward_funcs_names]
         config["trl"]["reward_weights"] = [reward_function.reward_weight for reward_function in dataset_type.reward_functions]
     elif isinstance(dataset_type, EnvironmentDatasetType):
-        # Switch based on the environment
-        env = dataset_type.environment_name
+        env = (dataset_type.environment_names or [None])[0]
         if env in (EnvironmentName.GIN_RUMMY, EnvironmentName.LIARS_DICE, EnvironmentName.LEDUC_POKER):
             config["trl"]["rollout_func"] = f"{env.value}.rollout_first_prompt_and_completion"
             config["trl"]["reward_funcs"] = [f"{env.value}.rollout_reward_func"]

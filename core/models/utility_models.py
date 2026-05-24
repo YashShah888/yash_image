@@ -107,7 +107,7 @@ class GrpoDatasetType(BaseModel):
 
 
 class EnvironmentDatasetType(BaseModel):
-    environment_name: EnvironmentName | None = None
+    environment_names: list[EnvironmentName] | None = None
 
 
 class DpoDatasetType(BaseModel):
@@ -226,6 +226,7 @@ class GPUInfo(BaseModel):
     vram_gb: int = Field(..., description="GPU VRAM in GB")
     available: bool = Field(..., description="GPU Availability")
     used_until: datetime | None = Field(default=None, description="GPU Used Until")
+    updated_at: datetime | None = Field(default=None, description="When GPU status was last updated")
 
 
 class TrainerInfo(BaseModel):

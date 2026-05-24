@@ -1,23 +1,30 @@
 import argparse
 import asyncio
+import json
 import os
 import shutil
 import tempfile
-import json
 from pathlib import Path
+
+import torch
 from huggingface_hub import HfApi
 from huggingface_hub import hf_hub_download
 from huggingface_hub import snapshot_download
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
 from transformers import CLIPTokenizer
 
 import trainer.utils.training_paths as train_paths
 from core.models.utility_models import FileFormat
-from core.models.utility_models import TaskType
 from core.models.utility_models import ImageModelType
+from core.models.utility_models import TaskType
 from core.utils import download_s3_file
 from trainer import constants as cst
 from trainer.utils.model_anonymizer import get_anonymous_model_dir
 from trainer.utils.model_anonymizer import scrub_model_identity
+
+LORA_ADAPTER_CONFIG = "adapter_config.json"
 
 
 hf_api = HfApi()
@@ -128,12 +135,72 @@ async def download_base_model(repo_id: str, save_root: str, model_type: ImageMod
         return result
 
 
+def _detect_and_merge_lora(model_dir: str) -> None:
+    """If model_dir contains a LoRA adapter, merge it into the base model in-place.
+
+    After merge the directory contains full merged weights and the adapter
+    files are removed so downstream code sees a normal model.
+    """
+    adapter_config_path = os.path.join(model_dir, LORA_ADAPTER_CONFIG)
+    if not os.path.exists(adapter_config_path):
+        return
+
+    with open(adapter_config_path) as f:
+        adapter_config = json.load(f)
+
+    base_model_id = adapter_config.get("base_model_name_or_path")
+    if not base_model_id:
+        print(f"WARNING: {LORA_ADAPTER_CONFIG} missing base_model_name_or_path, skipping merge", flush=True)
+        return
+
+    print(f"[downloader] LoRA adapter detected in {model_dir}", flush=True)
+    print(f"[downloader] Base model: {base_model_id}", flush=True)
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"[downloader] Merging LoRA on {device}", flush=True)
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_id, torch_dtype=torch.float16, device_map=device,
+    )
+    base_tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+    lora_tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+    if len(lora_tokenizer) > base_model.get_input_embeddings().weight.shape[0]:
+        base_model.resize_token_embeddings(len(lora_tokenizer))
+
+    merged = PeftModel.from_pretrained(base_model, model_dir)
+    merged = merged.merge_and_unload(safe_merge=False)
+
+    # Disable peft hooks that break save_pretrained in newer transformers
+    if hasattr(merged, "_hf_peft_config_loaded"):
+        merged._hf_peft_config_loaded = False
+
+    # Save merged model to a temp dir, then swap into model_dir
+    merge_tmp = model_dir + ".merged_tmp"
+    os.makedirs(merge_tmp, exist_ok=True)
+    merged.save_pretrained(merge_tmp, safe_serialization=True)
+    target_tokenizer = lora_tokenizer if len(lora_tokenizer) >= len(base_tokenizer) else base_tokenizer
+    target_tokenizer.save_pretrained(merge_tmp)
+
+    del base_model, merged
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Replace adapter dir with merged weights
+    shutil.rmtree(model_dir)
+    os.rename(merge_tmp, model_dir)
+    print(f"[downloader] LoRA merge complete → {model_dir}", flush=True)
+
+
 async def download_axolotl_base_model(repo_id: str, save_dir: str, anonymize: bool = True) -> str:
     model_dir = os.path.join(save_dir, _model_dir_name(repo_id, anonymize))
     if os.path.exists(model_dir):
-        print(f"Model already cached at {model_dir}. Skipping download.")
+        print(f"Model already cached at {model_dir}.", flush=True)
+        _detect_and_merge_lora(model_dir)
+        print(f"Skipping download.", flush=True)
         return model_dir
     snapshot_download(repo_id=repo_id, repo_type="model", local_dir=model_dir, local_dir_use_symlinks=False)
+    _detect_and_merge_lora(model_dir)
     if anonymize:
         scrub_model_identity(model_dir)
     return model_dir

@@ -3,7 +3,6 @@ import glob
 import json
 import logging
 import os
-import signal
 import importlib.util
 import subprocess
 import sys
@@ -20,6 +19,8 @@ from validator.core import constants as vcst
 from validator.evaluation.utils import (
     check_for_lora,
     check_lora_has_added_tokens,
+    configure_eval_logging,
+    stop_process,
 )
 
 
@@ -156,27 +157,6 @@ def _merge_base_and_lora(base_model_path: str, lora_dir: str, output_dir: str = 
     return output_dir
 
 
-def _configure_logging() -> None:
-    """
-    Ensure INFO logs reach stderr (Basilica/Docker). If root was configured earlier,
-    basicConfig alone is a no-op; attach a stderr handler explicitly.
-    """
-    level_name = os.getenv("EVAL_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    fmt = "%(asctime)s %(levelname)s %(name)s - %(message)s"
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setLevel(level)
-    handler.setFormatter(logging.Formatter(fmt))
-    root = logging.getLogger()
-    root.setLevel(level)
-    for h in root.handlers[:]:
-        root.removeHandler(h)
-        try:
-            h.close()
-        except Exception:
-            pass
-    root.addHandler(handler)
-    logger.setLevel(level)
 
 
 def _parse_environment_name() -> cst.EnvironmentName:
@@ -186,7 +166,7 @@ def _parse_environment_name() -> cst.EnvironmentName:
     if not env_name:
         try:
             dataset_type = EnvironmentDatasetType.model_validate_json(dataset_type_raw)
-            env_name = dataset_type.environment_name
+            env_name = (dataset_type.environment_names or [None])[0]
         except Exception:
             env_name = None
 
@@ -227,20 +207,6 @@ def _start_process(command: str, name: str) -> subprocess.Popen:
     )
 
 
-def _stop_process(proc: subprocess.Popen | None, name: str) -> None:
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:
-            logger.info("Stopping %s (pid=%s)", name, proc.pid)
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                proc.wait(timeout=10)
-    except Exception as exc:
-        logger.warning("Failed to stop %s cleanly: %s", name, exc)
 
 
 async def _wait_for_health(
@@ -658,8 +624,8 @@ async def _run() -> None:
         )
         logger.info("Environment evaluation complete. avg_score=%.6f", avg_score)
     finally:
-        _stop_process(env_proc, "env-server")
-        _stop_process(sglang_proc, "sglang")
+        stop_process(env_proc, "env-server")
+        stop_process(sglang_proc, "sglang")
         if env_log_task:
             env_log_task.cancel()
         if sglang_log_task:
@@ -667,7 +633,7 @@ async def _run() -> None:
 
 
 def main() -> int:
-    _configure_logging()
+    configure_eval_logging()
     try:
         asyncio.run(_run())
         return 0

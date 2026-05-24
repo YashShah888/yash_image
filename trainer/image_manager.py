@@ -185,11 +185,7 @@ async def run_trainer_container_image(
 
     environment: dict[str, str] = {"TRANSFORMERS_CACHE": cst.HUGGINGFACE_CACHE_PATH}
     if baseline_stats:
-        vol = client.volumes.get(cst.CACHE_VOLUME_NAME)
-        stats_filename = f"baseline_stats_{task_id}.json"
-        with open(os.path.join(vol.attrs["Mountpoint"], stats_filename), "w") as f:
-            json.dump(baseline_stats.model_dump(), f)
-        environment["BASELINE_STATS_PATH"] = os.path.join(cst.CACHE_ROOT_PATH, stats_filename)
+        environment["BASELINE_STATS"] = json.dumps(baseline_stats.model_dump())
 
     container_name = f"image-trainer-{uuid.uuid4().hex}"
 
@@ -264,11 +260,7 @@ async def run_trainer_container_text(
 
     environment = build_wandb_env(task_id, hotkey)
     if baseline_stats:
-        vol = client.volumes.get(cst.CACHE_VOLUME_NAME)
-        stats_filename = f"baseline_stats_{task_id}.json"
-        with open(os.path.join(vol.attrs["Mountpoint"], stats_filename), "w") as f:
-            json.dump(baseline_stats.model_dump(), f)
-        environment["BASELINE_STATS_PATH"] = os.path.join(cst.CACHE_ROOT_PATH, stats_filename)
+        environment["BASELINE_STATS"] = json.dumps(baseline_stats.model_dump())
     if env_server_urls:
         environment["ENVIRONMENT_SERVER_URLS"] = env_server_urls
     if miner_datasets:
@@ -858,9 +850,10 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
         if task_type == TaskType.ENVIRONMENTTASK:
             logger.info("Running Environment Server Containers", extra=log_labels)
             await log_task(training_data.task_id, task.hotkey, "Starting Environment Servers...")
+            env_name = (task.training_data.dataset_type.environment_names or [None])[0]
             for gpu in task.gpu_ids:
                 environment_server_container = await run_environment_server_container(
-                    task.training_data.dataset_type.environment_name, log_labels
+                    env_name, log_labels
                 )
                 env_server_containers.append(environment_server_container)
                 ip_address = await wait_for_env_container_ip(environment_server_container)

@@ -54,7 +54,7 @@ def select_target_layers(
     elif scope == AugmentationScope.ALL_LAYERS:
         return weight_layers
 
-    return weight_layers
+    raise ValueError(f"Unknown augmentation scope: {scope}")
 
 
 def apply_augmentation(

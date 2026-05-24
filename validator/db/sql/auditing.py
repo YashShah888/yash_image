@@ -133,8 +133,8 @@ async def get_recent_tasks(
             ct.chat_user_reference,
             ct.chat_assistant_reference,
             ct.file_format as chat_file_format,
-            et.environment_name as env_environment_name,
-            et.eval_seed as env_eval_seed
+            et.{cst.ENVIRONMENT_NAMES} as env_{cst.ENVIRONMENT_NAMES},
+            et.{cst.EVAL_SEED} as env_{cst.EVAL_SEED}
         FROM task_ids
         JOIN {cst.TASKS_TABLE} t ON t.{cst.TASK_ID} = task_ids.{cst.TASK_ID}
         LEFT JOIN {cst.INSTRUCT_TEXT_TASKS_TABLE} itt ON t.{cst.TASK_ID} = itt.{cst.TASK_ID}
@@ -186,8 +186,8 @@ async def get_recent_tasks(
                 task_data["file_format"] = task_data.pop("dpo_file_format")
                 task = DpoTask(**{k: v for k, v in task_data.items() if k in DpoTask.model_fields})
             elif task_type == TaskType.ENVIRONMENTTASK.value:
-                task_data["environment_name"] = task_data.pop("env_environment_name")
-                task_data["eval_seed"] = task_data.pop("env_eval_seed")
+                task_data[cst.ENVIRONMENT_NAMES] = task_data.pop(f"env_{cst.ENVIRONMENT_NAMES}", [])
+                task_data[cst.EVAL_SEED] = task_data.pop(f"env_{cst.EVAL_SEED}", None)
                 task = EnvTask(**{k: v for k, v in task_data.items() if k in EnvTask.model_fields})
             elif task_type == TaskType.GRPOTASK.value:
                 task_data["field_prompt"] = task_data.pop("grpo_field_prompt")
@@ -387,7 +387,7 @@ async def _process_task_batch(
     if env_task_ids:
         placeholders = ", ".join("$%d::uuid" % (i + 1) for i in range(len(env_task_ids)))
         query = f"""
-            SELECT {cst.TASK_ID}, {cst.ENVIRONMENT_NAME}, {cst.EVAL_SEED} FROM {cst.ENV_TASKS_TABLE}
+            SELECT {cst.TASK_ID}, {cst.ENVIRONMENT_NAMES}, {cst.EVAL_SEED} FROM {cst.ENV_TASKS_TABLE}
             WHERE {cst.TASK_ID} IN ({placeholders})
         """
         rows = await connection.fetch(query, *env_task_ids)

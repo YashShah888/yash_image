@@ -176,7 +176,7 @@ class ModelPrepRequest(BaseModel):
     task_id: str
     model_id: str
     training_data_url: str
-    task_type: str = "instruct"
+    task_type: str = TaskType.INSTRUCTTEXTTASK.value
     augmentation_config: AugmentationConfig | None = None
     gpu_ids: list[int] = [0]
     reward_functions: list[RewardFunction] | None = None
@@ -327,8 +327,8 @@ class NewTaskRequestChat(NewTaskRequest):
 
 
 class NewTaskRequestEnvironment(NewTaskRequest):
-    environment_name: EnvironmentName = Field(
-        ..., description="The name of the specific environment we are training for.", examples=["gin_rummy"]
+    environment_names: list[EnvironmentName] = Field(
+        ..., description="Environments to train on.", examples=[["gin_rummy", "liars_dice"]]
     )
 
     ds_repo: str = Field(..., description="The repository for the dataset", examples=["Magpie-Align/Magpie-Pro-300K-Filtered"])
@@ -570,7 +570,7 @@ class GrpoTaskDetails(TaskDetails):
 
 class EnvironmentTaskDetails(TaskDetails):
     task_type: TaskType = TaskType.ENVIRONMENTTASK
-    environment_name: EnvironmentName
+    environment_names: list[EnvironmentName] = []
     base_model_repository: str
     ds_repo: str
 

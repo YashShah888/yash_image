@@ -6,7 +6,6 @@ from core.constants import NETUID
 from core.constants import EnvironmentName
 from core.models.model_prep_models import AugmentationScope
 from core.models.model_prep_models import AugmentationType
-from core.models.utility_models import TaskType
 
 
 RAYONLABS_HF_USERNAME = "gradients-io-tournaments"  # "besimray"  # "rayonlabs"
@@ -146,7 +145,7 @@ MAX_CONCURRENT_MINER_ASSIGNMENTS = 5
 MAX_CONCURRENT_TASK_PREPS = 3
 MAX_EVALUATING_ROWS = 10
 
-PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_INSTRUCT_TEXT = 0.4
+PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_INSTRUCT_TEXT = 0.5
 PERCENTAGE_OF_INSTRUCT_TASKS_THAT_SHOULD_BE_CHAT = 0.5
 PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_IMAGE = 0.2
 PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_DPO = 0.15
@@ -330,17 +329,7 @@ MODEL_COPY_ENDPOINT = "https://huggingface.co/api/models/{source_repo}/duplicate
 
 # Model prep constants
 BASELINE_STATS_ENABLED_ORGANIC = False  # Run model prep (stats) for organic requests
-MODEL_PREP_ENABLED_TEXT = True  # Route text tasks through model prep (augmentation + baseline stats)
-MODEL_PREP_ENABLED_IMAGE = False  # Route image tasks through model prep
-MODEL_PREP_ENABLED_ENV = False  # Route environment tasks through model prep
-MODEL_PREP_ENABLED_BY_TASK_TYPE: dict[TaskType, bool] = {
-    TaskType.INSTRUCTTEXTTASK: MODEL_PREP_ENABLED_TEXT,
-    TaskType.DPOTASK: MODEL_PREP_ENABLED_TEXT,
-    TaskType.GRPOTASK: MODEL_PREP_ENABLED_TEXT,
-    TaskType.CHATTASK: MODEL_PREP_ENABLED_TEXT,
-    TaskType.IMAGETASK: MODEL_PREP_ENABLED_IMAGE,
-    TaskType.ENVIRONMENTTASK: MODEL_PREP_ENABLED_ENV,
-}
+
 
 # Model augmentation constants
 AUGMENTATION_ENABLED_TEXT = True  # Enable augmentations for text tasks
@@ -400,7 +389,7 @@ SGLANG_FLASHINFER_WORKSPACE_MIN_BYTES = 4 * 1024 * 1024 * 1024
 EVAL_BASILICA_CPU = "4"
 EVAL_BASILICA_MEMORY = "64Gi"
 EVAL_BASILICA_TTL_SECONDS = 16000
-EVAL_BASILICA_TIMEOUT = 1800
+EVAL_BASILICA_TIMEOUT = 14400
 EVAL_BASILICA_MAX_RETRIES = 3
 EVAL_BASILICA_RETRY_DELAY_SECONDS = 900
 EVAL_BASILICA_POLL_INTERVAL_SECONDS = 300
@@ -415,3 +404,45 @@ LOCAL_ENV_SERVER_PORT = 8001
 LOCAL_ENV_SGLANG_HEALTH_TIMEOUT = 600
 LOCAL_ENV_SERVER_HEALTH_TIMEOUT = 300
 LOCAL_ENV_HF_CACHE_PATH = "/mnt/hf_cache"
+
+# PvP evaluation constants
+PVP_SGLANG_HOST = "127.0.0.1"
+PVP_SGLANG_PORT_A = 30000
+PVP_SGLANG_PORT_B = 30001
+PVP_SGLANG_HEALTH_TIMEOUT = 1800
+PVP_SGLANG_HEALTH_PATH = "/v1/models"
+PVP_SGLANG_API_PATH = "/v1"
+PVP_RESULTS_PATH = "/app/pvp_results.json"
+PVP_CONFIG_PATH = "/config/pvp_eval.json"
+PVP_CONFIG_ENV_VAR = "PVP_EVAL_CONFIG"
+PVP_SEED_RANGE_MAX = 1_000_000
+PVP_CONFIG_ID_DIVISOR = 100_000_000
+PVP_LOG_INTERVAL_GAMES = 100
+PVP_BOT_MAX_PARSING_RETRIES = 0
+PVP_TURN_TIMEOUT_SECONDS = 5
+PVP_RETRY_BACKOFF_CAP_SECONDS = 32
+MCTS_WIN_MARGIN = 0.015
+
+# PvP tournament scoring
+PVP_ENV_WIN_POINTS = 3
+PVP_ENV_DRAW_POINTS = 1
+PVP_ENV_LOSS_POINTS = 0
+PVP_NUM_GAMES_PER_ENV = 100
+PVP_CONSECUTIVE_LOSS_FORFEIT = 10
+PVP_WIN_PCT_THRESHOLD = 0.60
+PVP_PERF_DIFF_SLOPE = 0.125  # Linear map: 60% win rate → emission threshold, 100% → max boost
+
+# PvP Basilica deployment
+PVP_BASILICA_TTL_SECONDS = 28800
+PVP_BASILICA_GPU_COUNT = 2
+PVP_BASILICA_PORT = 8000
+
+# HuggingFace container env vars (shared across all eval containers)
+_HF_CONTAINER_ENV_BASE = {
+    "HF_HOME": "/root/.cache/huggingface",
+    "TRANSFORMERS_CACHE": "/root/.cache/huggingface/hub",
+    "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets",
+    "HUGGINGFACE_HUB_CACHE": "/root/.cache/huggingface/hub",
+}
+HF_CONTAINER_ENV = {**_HF_CONTAINER_ENV_BASE, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
+HF_CONTAINER_ENV_IMAGE = {**_HF_CONTAINER_ENV_BASE, "HF_HUB_ENABLE_HF_TRANSFER": "0"}

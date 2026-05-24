@@ -21,7 +21,23 @@ IS_PROD_ENV = NETUID == DEFAULT_NETUID
 VALIDATOR_DOCKER_IMAGE = "gradientsio/text-evaluator:basilica"
 VALIDATOR_DOCKER_IMAGE_DIFFUSION = "gradientsio/image-evaluator:basilica"
 VALIDATOR_DOCKER_IMAGE_ENV = "gradientsio/env-evaluator:basilica"
+VALIDATOR_DOCKER_IMAGE_PVP = "weightswandering/pvp-evaluator:v5"
 MCTS_API_DOCKER_IMAGE = "diagonalge/mcts-api:latest"
+
+
+class EvalType(str, Enum):
+    MCTS = "mcts"
+    PVP = "pvp"
+
+
+class TrainingStartPoint(str, Enum):
+    """What model a task trains from."""
+
+    DEFAULT = "default"
+    CONTINUATION = "continuation"
+    FROM_SCRATCH = "from_scratch"
+    PREVIOUS_WINNER = "previous_winner"
+
 
 
 class EnvironmentName(str, Enum):
@@ -36,8 +52,9 @@ class EnvironmentConfig:
     task_id_max: int
     num_seeds: int
     num_baseline_episodes: int
-    env_image: str
-    eval_payload_extra: dict
+    eval_type: EvalType
+    env_image: str = ""
+    eval_payload_extra: dict | None = None
 
 
 ENVIRONMENT_CONFIGS: dict[EnvironmentName, EnvironmentConfig] = {
@@ -46,6 +63,7 @@ ENVIRONMENT_CONFIGS: dict[EnvironmentName, EnvironmentConfig] = {
         task_id_max=299_999_999,
         num_seeds=2000,
         num_baseline_episodes=50,
+        eval_type=EvalType.PVP,
         env_image=MCTS_API_DOCKER_IMAGE,
         eval_payload_extra={
             "opponent": "mcts",
@@ -59,6 +77,7 @@ ENVIRONMENT_CONFIGS: dict[EnvironmentName, EnvironmentConfig] = {
         task_id_max=199_999_999,
         num_seeds=10_000,
         num_baseline_episodes=50,
+        eval_type=EvalType.PVP,
         env_image=MCTS_API_DOCKER_IMAGE,
         eval_payload_extra={
             "opponent": "mcts",
@@ -72,6 +91,7 @@ ENVIRONMENT_CONFIGS: dict[EnvironmentName, EnvironmentConfig] = {
         task_id_max=399_999_999,
         num_seeds=1000,
         num_baseline_episodes=25,
+        eval_type=EvalType.PVP,
         env_image=MCTS_API_DOCKER_IMAGE,
         eval_payload_extra={
             "opponent": "mcts",
@@ -83,6 +103,7 @@ ENVIRONMENT_CONFIGS: dict[EnvironmentName, EnvironmentConfig] = {
 }
 
 CONTAINER_EVAL_RESULTS_PATH = "/aplp/evaluation_results.json"
+LORA_ADAPTER_CONFIG_FILE = "adapter_config.json"
 
 CONFIG_DIR = "core/config/"
 OUTPUT_DIR = "core/outputs/"

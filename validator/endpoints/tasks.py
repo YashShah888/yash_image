@@ -159,7 +159,7 @@ async def create_task_environment(
     task = EnvRawTask(
         model_id=request.model_repo,
         ds=request.ds_repo,
-        environment_name=request.environment_name,
+        environment_names=request.environment_names,
         is_organic=True,
         status=TaskStatus.PENDING,
         created_at=current_time,

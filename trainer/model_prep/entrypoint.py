@@ -1,6 +1,6 @@
 """
 Model prep container entrypoint.
-Augments model (if config provided), computes baseline stats, uploads to HF.
+Handles LoRA detection + merge, augmentation, baseline stats, and HF upload.
 Outputs JSON result on the last line of stdout for the caller to parse.
 """
 
@@ -14,15 +14,18 @@ import time
 
 import torch
 from huggingface_hub import HfApi
+from huggingface_hub import hf_hub_download
 from huggingface_hub import repo_exists
+from peft import PeftModel
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 
+from core import constants as cst
 from core.utils import download_s3_file
-
 from core.models.model_prep_models import AugmentationConfig
 from core.models.model_prep_models import AugmentationScope
 from core.models.model_prep_models import AugmentationType
+from core.models.model_prep_models import ModelPrepResult
 from core.constants import EnvironmentName
 from core.models.utility_models import TaskType
 from trainer.model_prep.augmentation import augment_model
@@ -30,11 +33,89 @@ from trainer.model_prep.env_stats import compute_env_stats
 from trainer.model_prep.stats import compute_text_stats
 
 
+def detect_and_merge_lora(model_id: str, hf_token: str) -> ModelPrepResult:
+    """Auto-detect LoRA adapter and merge with base if needed.
+
+    model_id can be a local path or HF repo. Checks for adapter_config.json
+    locally first, falls back to HF API for remote repos.
+    """
+    adapter_config_path = os.path.join(model_id, cst.LORA_ADAPTER_CONFIG_FILE)
+    is_local = os.path.isdir(model_id)
+
+    if is_local:
+        if not os.path.exists(adapter_config_path):
+            return ModelPrepResult(effective_model_path=model_id)
+    else:
+        try:
+            api = HfApi(token=hf_token)
+            repo_files = api.list_repo_files(model_id, token=hf_token)
+            if cst.LORA_ADAPTER_CONFIG_FILE not in repo_files:
+                return ModelPrepResult(effective_model_path=model_id)
+        except Exception as exc:
+            print(f"Could not check for LoRA: {exc}, loading as full weights", flush=True)
+            return ModelPrepResult(effective_model_path=model_id)
+
+    print(f"LoRA adapter detected: {model_id}", flush=True)
+
+    try:
+        if is_local:
+            with open(adapter_config_path) as f:
+                adapter_config = json.load(f)
+        else:
+            config_path = hf_hub_download(model_id, cst.LORA_ADAPTER_CONFIG_FILE, token=hf_token)
+            with open(config_path) as f:
+                adapter_config = json.load(f)
+
+        base_model_id = adapter_config.get("base_model_name_or_path")
+        if not base_model_id:
+            print("WARNING: adapter_config missing base_model_name_or_path, loading as-is", flush=True)
+            return ModelPrepResult(effective_model_path=model_id)
+
+        print(f"Merging LoRA into base: {base_model_id}", flush=True)
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id, torch_dtype=torch.float16, token=hf_token,
+            device_map="cuda:0" if torch.cuda.is_available() else "auto",
+        )
+        base_tokenizer = AutoTokenizer.from_pretrained(base_model_id, token=hf_token)
+        lora_tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+
+        if len(lora_tokenizer) > base_model.get_input_embeddings().weight.shape[0]:
+            base_model.resize_token_embeddings(len(lora_tokenizer))
+
+        merged = PeftModel.from_pretrained(base_model, model_id, token=hf_token)
+        merged = merged.merge_and_unload(safe_merge=False)
+
+        merge_dir = "/cache/merged_model"
+        os.makedirs(merge_dir, exist_ok=True)
+        merged.save_pretrained(merge_dir, safe_serialization=True)
+        target_tokenizer = lora_tokenizer if len(lora_tokenizer) >= len(base_tokenizer) else base_tokenizer
+        target_tokenizer.save_pretrained(merge_dir)
+
+        del base_model, merged
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(f"LoRA merge complete → {merge_dir}", flush=True)
+        return ModelPrepResult(
+            effective_model_path=merge_dir,
+            base_model_id=base_model_id,
+            was_lora=True,
+        )
+    except Exception as exc:
+        print(f"WARNING: LoRA merge failed ({exc}), falling back to full-weight loading", flush=True)
+        return ModelPrepResult(effective_model_path=model_id)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--training-data", required=True, help="S3 URL or local path to training data")
-    parser.add_argument("--task-type", default="instruct", help="Task type: instruct, dpo, grpo, chat")
+    parser.add_argument(
+        "--task-type", default=TaskType.INSTRUCTTEXTTASK.value,
+        choices=[t.value for t in TaskType],
+        help="Task type",
+    )
     parser.add_argument("--aug-type", choices=[t.value for t in AugmentationType], default=None)
     parser.add_argument("--scope", choices=[s.value for s in AugmentationScope], default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -63,8 +144,8 @@ def generate_anonymous_repo_name(model_id: str, seed: int) -> str:
     return f"{hf_username}/augmented-{repo_hash}"
 
 
-def load_training_data(path: str) -> list[dict]:
-    """Load all training data from a JSON file."""
+def load_training_data(path: str, max_records: int = 100) -> list[dict]:
+    """Load training data from a JSON file."""
     if path.startswith("http"):
         local_path = asyncio.run(download_s3_file(path))
     else:
@@ -74,7 +155,7 @@ def load_training_data(path: str) -> list[dict]:
         data = json.load(f)
 
     if isinstance(data, list):
-        return data
+        return data[:max_records]
     return []
 
 
@@ -112,23 +193,29 @@ def main():
     aug_config = build_augmentation_config(args)
     hf_token = os.environ.get("HUGGINGFACE_TOKEN", "")
 
+    # Auto-detect LoRA and merge if needed (for model continuation between rounds)
+    prep_result = detect_and_merge_lora(args.model, hf_token)
+    model_path = prep_result.effective_model_path
+    if prep_result.was_lora:
+        print(f"Using merged model from {model_path} (base: {prep_result.base_model_id})", flush=True)
+
     # --- Model loading ---
     t0 = time.time()
     n_gpus = torch.cuda.device_count()
-    print(f"[model_prep] Loading model: {args.model} (gpus={n_gpus})", flush=True)
+    print(f"[model_prep] Loading model: {model_path} (gpus={n_gpus})", flush=True)
     if n_gpus > 1:
         print(f"[model_prep] Multi-GPU detected ({n_gpus}), using device_map=auto", flush=True)
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.float16, token=hf_token, device_map="auto",
+            model_path, torch_dtype=torch.float16, token=hf_token, device_map="auto",
         )
     elif torch.cuda.is_available():
         model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.float16, token=hf_token,
+            model_path, torch_dtype=torch.float16, token=hf_token,
         )
         model.to("cuda")
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.model, token=hf_token)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, token=hf_token)
+        model = AutoModelForCausalLM.from_pretrained(model_path, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, token=hf_token)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"[model_prep] Model loaded in {time.time() - t0:.1f}s ({num_params / 1e9:.1f}B params)", flush=True)
 
@@ -200,6 +287,7 @@ def main():
     result = {
         "augmented_model_id": augmented_model_id,
         "baseline_stats": stats.model_dump() if stats else None,
+        "lora_merge": prep_result.model_dump() if prep_result.was_lora else None,
     }
     def sanitize_floats(obj):
         """Replace NaN/Inf with None for JSON compliance."""

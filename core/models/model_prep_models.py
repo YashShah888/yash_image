@@ -11,6 +11,7 @@ from typing import Union
 
 from pydantic import BaseModel
 from pydantic import Discriminator
+from pydantic import Field
 from pydantic import Tag
 from pydantic import model_validator
 
@@ -18,6 +19,15 @@ from core.constants import EnvironmentName
 
 
 # --- Augmentation models ---
+
+class ModelPrepResult(BaseModel):
+    """Result of LoRA detection and optional merge."""
+
+    effective_model_path: str = Field(description="Path or repo ID to use for loading (merged if LoRA)")
+    base_model_id: str | None = Field(default=None, description="Original base model if LoRA was merged")
+    was_lora: bool = Field(default=False, description="Whether the input was a LoRA adapter")
+
+
 
 class AugmentationType(str, Enum):
     GAUSSIAN_NOISE = "gaussian_noise"

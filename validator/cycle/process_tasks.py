@@ -5,6 +5,7 @@ import validator.core.constants as cst
 import validator.db.sql.nodes as nodes_sql
 import validator.db.sql.tasks as tasks_sql
 import validator.db.sql.tournaments as tournament_sql
+from core.models.pvp_models import PvPIncompleteError
 from core.models.utility_models import TaskStatus
 from core.models.utility_models import TaskType
 from validator.core.config import Config
@@ -16,12 +17,15 @@ from validator.cycle.util_functions import get_model_num_params
 from validator.db.database import PSQLDB
 from validator.evaluation.scoring import evaluate_and_score_hotkeys
 from validator.evaluation.scoring import finalize_task_scores_from_raw_losses
+from validator.evaluation.scoring import should_use_pvp
 from validator.tournament.utils import send_to_discord
 from validator.utils.cache_clear import clean_all_hf_datasets_cache
 from validator.utils.cache_clear import manage_models_cache
 from validator.utils.logging import LogContext
 from validator.utils.logging import add_context_tag
 from validator.utils.logging import get_logger
+
+
 logger = get_logger(__name__)
 _EVALUATING_ROWS_LOCK = asyncio.Lock()
 
@@ -111,17 +115,10 @@ async def _prep_task(task: AnyTypeRawTask, config: Config):
             task = await get_task_config(task).task_prep_function(task, config.keypair, config.psql_db)
             logger.info(f"THE TASK HAS BEEN PREPPED {task}")
 
-            # Determine whether this task needs model prep (augmentation + baseline stats).
-            # Per-task-type gate first, then organic override.
-            type_enabled = cst.MODEL_PREP_ENABLED_BY_TASK_TYPE.get(task.task_type, False)
-            needs_model_prep = type_enabled and not (task.is_organic and not cst.BASELINE_STATS_ENABLED_ORGANIC)
-
-            if needs_model_prep:
+            if not (task.is_organic and not cst.BASELINE_STATS_ENABLED_ORGANIC):
                 task.status = TaskStatus.AWAITING_MODEL_PREP
-            else:
-                task.status = TaskStatus.LOOKING_FOR_NODES
+                logger.info(f"Task {task.task_id} prepped, moving to {task.status.value}")
 
-            add_context_tag("status", task.status.value)
             await tasks_sql.update_task(task, config.psql_db)
         except Exception as e:
             logger.error(f"Error during task prep: {e}", exc_info=True)
@@ -153,7 +150,8 @@ async def _seed_task_evaluations_for_evaluation(config: Config) -> None:
     for task in preevaluation_tasks:
         try:
             assert task.task_id is not None
-            await tasks_sql.add_task_evaluation_pairs(task.task_id, config.psql_db)
+            pvp = should_use_pvp(task)
+            await tasks_sql.add_task_evaluation_pairs(task.task_id, config.psql_db, include_failed_training=pvp)
             task.status = TaskStatus.EVALUATING
             add_context_tag("status", task.status.value)
             await tasks_sql.update_task(task, config.psql_db)
@@ -231,21 +229,15 @@ async def _finalize_task_status_from_evaluations(task: AnyTypeRawTask, config: C
 
     await finalize_task_scores_from_raw_losses(task, [row["hotkey"] for row in rows], config)
 
-    if any(status == "failure" for status in statuses):
+    if not successful_hotkeys:
         task.status = TaskStatus.FAILURE
         add_context_tag("status", task.status.value)
-        failed_hotkeys = [row["hotkey"] for row in rows if row["evaluation_status"] == "failure"]
-        if config.discord_url:
-            try:
-                await send_to_discord(
-                    config.discord_url,
-                    f"Evaluation failed for task {task.task_id}. Failed hotkeys: {failed_hotkeys}",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send evaluation webhook: {e}")
     else:
         task.status = TaskStatus.SUCCESS
         add_context_tag("status", task.status.value)
+        failed_hotkeys = [row["hotkey"] for row in rows if row["evaluation_status"] == "failure"]
+        if failed_hotkeys:
+            logger.info(f"Task {task.task_id} succeeded with {len(failed_hotkeys)} failed hotkeys: {failed_hotkeys}")
 
     task.n_eval_attempts = (task.n_eval_attempts or 0) + 1
     await tasks_sql.update_task(task, config.psql_db)
@@ -257,11 +249,11 @@ async def _evaluate_and_update_hotkeys(task: AnyTypeRawTask, hotkeys: list[str],
     assert task.task_id is not None
 
     try:
-        evaluated_hotkeys, failed_hotkeys = await evaluate_and_score_hotkeys(task, hotkeys, num_gpus, config)
-        not_evaluated_hotkeys = [h for h in hotkeys if h not in set(evaluated_hotkeys)]
-        failed_set = set(failed_hotkeys)
+        eval_result = await evaluate_and_score_hotkeys(task, hotkeys, num_gpus, config)
+        not_evaluated_hotkeys = [h for h in hotkeys if h not in set(eval_result.evaluated)]
+        failed_set = set(eval_result.failed)
         failed_set.update(not_evaluated_hotkeys)
-        success_hotkeys = [evaluated_hotkey for evaluated_hotkey in evaluated_hotkeys if evaluated_hotkey not in failed_set]
+        success_hotkeys = [h for h in eval_result.evaluated if h not in failed_set]
 
         await tasks_sql.update_task_evaluations_status(task.task_id, success_hotkeys, "success", config.psql_db)
         await tasks_sql.update_task_evaluations_status(
@@ -270,6 +262,9 @@ async def _evaluate_and_update_hotkeys(task: AnyTypeRawTask, hotkeys: list[str],
             "failure",
             config.psql_db,
         )
+    except PvPIncompleteError as e:
+        logger.info(f"PvP eval incomplete for task {task.task_id}: {e} — resetting to pending for retry")
+        await tasks_sql.update_task_evaluations_status(task.task_id, hotkeys, "pending", config.psql_db)
     except Exception as e:
         logger.error(f"Error evaluating pending pairs for task {task.task_id}: {e}", exc_info=True)
         await tasks_sql.update_task_evaluations_status(task.task_id, hotkeys, "failure", config.psql_db)
@@ -278,10 +273,10 @@ async def _evaluate_and_update_hotkeys(task: AnyTypeRawTask, hotkeys: list[str],
 async def _evaluate_pending_pairs_for_task(task: AnyTypeRawTask, num_gpus: int, config: Config):
     assert task.task_id is not None
 
-    if task.task_type == TaskType.GRPOTASK:
+    if task.task_type == TaskType.GRPOTASK or should_use_pvp(task):
         training_statuses = await tournament_sql.get_training_status_for_task(str(task.task_id), config.psql_db)
         if training_statuses and any(status not in ("success", "failure") for status in training_statuses.values()):
-            logger.info(f"GRPO task {task.task_id} still has non-terminal training rows; deferring batch evaluation")
+            logger.info(f"Task {task.task_id} still has non-terminal training rows; deferring batch evaluation")
             return
 
     pending_rows = await tasks_sql.get_task_evaluations_by_status(task.task_id, "pending", config.psql_db)
@@ -294,7 +289,8 @@ async def _evaluate_pending_pairs_for_task(task: AnyTypeRawTask, num_gpus: int, 
     evaluating_hotkeys = [row["hotkey"] for row in evaluating_rows]
     all_hotkeys = list(dict.fromkeys(pending_hotkeys + evaluating_hotkeys))
 
-    hotkey_batches = [all_hotkeys] if task.task_type == TaskType.GRPOTASK else [[hotkey] for hotkey in all_hotkeys]
+    batch_together = task.task_type == TaskType.GRPOTASK or should_use_pvp(task)
+    hotkey_batches = [all_hotkeys] if batch_together else [[hotkey] for hotkey in all_hotkeys]
     pending_evaluations = []
     for hotkeys in hotkey_batches:
         pending_batch = [hotkey for hotkey in hotkeys if hotkey in pending_hotkeys]

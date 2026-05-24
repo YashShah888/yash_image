@@ -4,6 +4,7 @@ from datetime import timedelta
 from datetime import timezone
 
 import validator.db.constants as cst
+from core.models.pvp_models import PvPEnvironmentResult, PvPPairDbRow, PvPPairResult
 from core.models.tournament_models import GroupRound
 from core.models.tournament_models import HotkeyTaskParticipation
 from core.models.tournament_models import TaskTrainingAssignment
@@ -206,7 +207,7 @@ async def get_tournament(tournament_id: str, psql_db: PSQLDB) -> TournamentData 
         query = f"""
             SELECT {cst.TOURNAMENT_ID}, {cst.TOURNAMENT_TYPE}, {cst.TOURNAMENT_STATUS},
                    {cst.BASE_WINNER_HOTKEY}, {cst.WINNER_HOTKEY}, {cst.WINNING_PERFORMANCE_DIFFERENCE},
-                   {cst.DIFF_REPORT}
+                   {cst.DIFF_REPORT}, {cst.WINNER_MODEL_REPO}, {cst.WINNER_MODEL_BASE}
             FROM {cst.TOURNAMENTS_TABLE}
             WHERE {cst.TOURNAMENT_ID} = $1
         """
@@ -220,6 +221,8 @@ async def get_tournament(tournament_id: str, psql_db: PSQLDB) -> TournamentData 
                 winner_hotkey=result[cst.WINNER_HOTKEY],
                 winning_performance_difference=result[cst.WINNING_PERFORMANCE_DIFFERENCE],
                 diff_report=result[cst.DIFF_REPORT],
+                winner_model_repo=result[cst.WINNER_MODEL_REPO],
+                winner_model_base=result[cst.WINNER_MODEL_BASE],
             )
         return None
 
@@ -312,7 +315,7 @@ async def get_latest_completed_tournament(
         query = f"""
             SELECT {cst.TOURNAMENT_ID}, {cst.TOURNAMENT_TYPE}, {cst.TOURNAMENT_STATUS},
                    {cst.BASE_WINNER_HOTKEY}, {cst.WINNER_HOTKEY}, {cst.WINNING_PERFORMANCE_DIFFERENCE},
-                   {cst.DIFF_REPORT}, {cst.UPDATED_AT}
+                   {cst.DIFF_REPORT}, {cst.UPDATED_AT}, {cst.WINNER_MODEL_REPO}, {cst.WINNER_MODEL_BASE}
             FROM {cst.TOURNAMENTS_TABLE}
             WHERE {cst.TOURNAMENT_TYPE} = $1 AND {cst.TOURNAMENT_STATUS} = 'completed'
             {exclude_clause}
@@ -334,6 +337,8 @@ async def get_latest_completed_tournament(
                 winning_performance_difference=result[cst.WINNING_PERFORMANCE_DIFFERENCE],
                 diff_report=result[cst.DIFF_REPORT],
                 updated_at=result[cst.UPDATED_AT],
+                winner_model_repo=result[cst.WINNER_MODEL_REPO],
+                winner_model_base=result[cst.WINNER_MODEL_BASE],
             )
         return None
 
@@ -496,6 +501,19 @@ async def update_tournament_winner_hotkey(tournament_id: str, winner_hotkey: str
         """
         await connection.execute(query, tournament_id, winner_hotkey)
         logger.info(f"Updated tournament {tournament_id} winner hotkey to {winner_hotkey}")
+
+
+async def update_tournament_winner_model(
+    tournament_id: str, winner_model_repo: str, winner_model_base: str, psql_db: PSQLDB,
+) -> None:
+    async with await psql_db.connection() as connection:
+        query = f"""
+            UPDATE {cst.TOURNAMENTS_TABLE}
+            SET {cst.WINNER_MODEL_REPO} = $2, {cst.WINNER_MODEL_BASE} = $3, {cst.UPDATED_AT} = CURRENT_TIMESTAMP
+            WHERE {cst.TOURNAMENT_ID} = $1
+        """
+        await connection.execute(query, tournament_id, winner_model_repo, winner_model_base)
+        logger.info(f"Updated tournament {tournament_id} winner model: {winner_model_repo} (base: {winner_model_base})")
 
 
 async def update_tournament_diff_report(tournament_id: str, diff_report: str, psql_db: PSQLDB):
@@ -661,7 +679,7 @@ async def get_trainers(psql_db: PSQLDB) -> list[TrainerInfo]:
     """Get all trainers and their GPU information from the database"""
     async with await psql_db.connection() as connection:
         query = f"""
-            SELECT {cst.TRAINER_IP}, {cst.GPU_ID}, {cst.GPU_TYPE}, {cst.VRAM_GB}, {cst.USED_UNTIL}
+            SELECT {cst.TRAINER_IP}, {cst.GPU_ID}, {cst.GPU_TYPE}, {cst.VRAM_GB}, {cst.USED_UNTIL}, {cst.UPDATED_AT}
             FROM {cst.TRAINERS_GPUS_TABLE}
             ORDER BY {cst.TRAINER_IP}, {cst.GPU_ID}
         """
@@ -685,6 +703,7 @@ async def get_trainers(psql_db: PSQLDB) -> list[TrainerInfo]:
                     vram_gb=row[cst.VRAM_GB],
                     available=available,
                     used_until=used_until,
+                    updated_at=row[cst.UPDATED_AT],
                 )
             )
 
@@ -1397,3 +1416,85 @@ async def get_weekly_task_participation_data(psql_db: PSQLDB) -> list[HotkeyTask
 
         logger.info(f"Found weekly task participation for {len(result)} hotkeys over 7 days")
         return result
+
+
+async def ensure_pvp_pairs_exist(
+    task_id: str,
+    pairs: list[PvPPairResult],
+    environment_names: list[str],
+    psql_db: PSQLDB,
+) -> None:
+    """Create pending rows for all required pair+env combos if they don't exist."""
+    async with await psql_db.connection() as connection:
+        for pair in pairs:
+            hk_a, hk_b = sorted([pair.hotkey_a, pair.hotkey_b])
+            for env in environment_names:
+                await connection.execute(f"""
+                    INSERT INTO {cst.PVP_PAIR_RESULTS_TABLE}
+                        ({cst.TASK_ID}, {cst.PVP_HOTKEY_A}, {cst.PVP_HOTKEY_B},
+                         {cst.PVP_ENVIRONMENT_NAME}, {cst.STATUS})
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT ({cst.TASK_ID}, {cst.PVP_HOTKEY_A}, {cst.PVP_HOTKEY_B},
+                                 {cst.PVP_ENVIRONMENT_NAME}) DO NOTHING
+                """, task_id, hk_a, hk_b, env, cst.PVP_STATUS_PENDING)
+
+
+async def save_pvp_pair_result(
+    task_id: str,
+    result: PvPPairResult,
+    environment_name: str,
+    env_result: PvPEnvironmentResult,
+    psql_db: PSQLDB,
+) -> None:
+    """Mark a pair+env as complete with results. Stores in sorted hotkey order."""
+    hk_a, hk_b = sorted([result.hotkey_a, result.hotkey_b])
+    swapped = hk_a != result.hotkey_a
+    a_wins = env_result.model_b_wins if swapped else env_result.model_a_wins
+    b_wins = env_result.model_a_wins if swapped else env_result.model_b_wins
+    async with await psql_db.connection() as connection:
+        await connection.execute(f"""
+            UPDATE {cst.PVP_PAIR_RESULTS_TABLE}
+            SET {cst.PVP_MODEL_A_WINS} = $5, {cst.PVP_MODEL_B_WINS} = $6,
+                {cst.PVP_DRAWS} = $7, {cst.PVP_TOTAL_GAMES} = $8,
+                {cst.STATUS} = $9, {cst.UPDATED_AT} = CURRENT_TIMESTAMP
+            WHERE {cst.TASK_ID} = $1 AND {cst.PVP_HOTKEY_A} = $2
+                AND {cst.PVP_HOTKEY_B} = $3 AND {cst.PVP_ENVIRONMENT_NAME} = $4
+        """, task_id, hk_a, hk_b, environment_name,
+            a_wins, b_wins, env_result.draws,
+            env_result.total_games, cst.PVP_STATUS_COMPLETE)
+
+
+async def increment_pvp_pair_attempts(
+    task_id: str, hotkey_a: str, hotkey_b: str, psql_db: PSQLDB,
+) -> None:
+    """Increment attempt count for all envs of a pair that aren't complete."""
+    hk_a, hk_b = sorted([hotkey_a, hotkey_b])
+    async with await psql_db.connection() as connection:
+        await connection.execute(f"""
+            UPDATE {cst.PVP_PAIR_RESULTS_TABLE}
+            SET {cst.PVP_N_ATTEMPTS} = {cst.PVP_N_ATTEMPTS} + 1,
+                {cst.UPDATED_AT} = CURRENT_TIMESTAMP
+            WHERE {cst.TASK_ID} = $1 AND {cst.PVP_HOTKEY_A} = $2
+                AND {cst.PVP_HOTKEY_B} = $3 AND {cst.STATUS} != $4
+        """, task_id, hk_a, hk_b, cst.PVP_STATUS_COMPLETE)
+
+
+async def get_pvp_pair_results(task_id: str, psql_db: PSQLDB) -> list[PvPPairDbRow]:
+    """Get all PvP pair result rows for a task."""
+    async with await psql_db.connection() as connection:
+        rows = await connection.fetch(f"""
+            SELECT {cst.PVP_HOTKEY_A}, {cst.PVP_HOTKEY_B}, {cst.PVP_ENVIRONMENT_NAME},
+                   {cst.PVP_MODEL_A_WINS}, {cst.PVP_MODEL_B_WINS}, {cst.PVP_DRAWS},
+                   {cst.PVP_TOTAL_GAMES}, {cst.STATUS}, {cst.PVP_N_ATTEMPTS}
+            FROM {cst.PVP_PAIR_RESULTS_TABLE}
+            WHERE {cst.TASK_ID} = $1
+        """, task_id)
+        return [PvPPairDbRow(task_id=task_id, **dict(r)) for r in rows]
+
+
+async def delete_pvp_pair_results(task_id: str, psql_db: PSQLDB) -> None:
+    """Delete all PvP pair results for a task (for full re-eval)."""
+    async with await psql_db.connection() as connection:
+        await connection.execute(
+            f"DELETE FROM {cst.PVP_PAIR_RESULTS_TABLE} WHERE {cst.TASK_ID} = $1", task_id
+        )

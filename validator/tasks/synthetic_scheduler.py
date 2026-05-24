@@ -15,6 +15,8 @@ from core.models.payload_models import ImageModelInfo
 from core.models.payload_models import ImageModelsResponse
 from core.models.payload_models import InstructTextDatasetColumnsResponse
 from core.constants import EnvironmentName
+from core.constants import TrainingStartPoint
+from core.models.scoring_models import EnvironmentWeight
 from core.models.utility_models import FileFormat
 from core.models.utility_models import Message
 from core.models.utility_models import Prompts
@@ -32,6 +34,7 @@ from validator.core.models import RewardFunction
 from validator.db.sql import grpo as grpo_sql
 from validator.db.sql.grpo import get_generic_reward_functions_from_db
 from validator.db.sql.tasks import add_task
+from validator.tournament import constants as t_cst
 from validator.utils.augmentation_decision import maybe_get_augmentation_config
 from validator.utils.call_endpoint import call_content_service
 from validator.utils.llm import convert_to_nineteen_payload
@@ -204,7 +207,7 @@ async def _get_columns_for_instruct_dataset(
     return columns
 
 
-def _get_training_hours_from_num_rows(num_rows: int) -> tuple[int, int]:
+def _get_training_hours_from_num_rows(num_rows: int) -> int:
     """Randomly select training hours for a given dataset size in bytes based on range bins."""
     min_hours, max_hours = 0, 0
     for min_rows, max_rows in vcst.INSTRUCT_TEXT_DATASET_BINS_TO_TRAINING_HOURS_RANGE.keys():
@@ -216,8 +219,8 @@ def _get_training_hours_from_num_rows(num_rows: int) -> tuple[int, int]:
     return random.randint(min_hours, max_hours)
 
 
-def _get_training_hours_for_environment_task() -> int:
-    return 3
+def _get_training_hours_for_environment_task(round_number: int = 1) -> float:
+    return t_cst.ENV_TRAINING_HOURS
 
 
 async def get_dataset(
@@ -339,8 +342,7 @@ async def _generate_generic_reward_functions_from_llm(keypair: Keypair, num_rewa
 
     result = await post_to_nineteen_chat_with_reasoning(payload, keypair, vcst.END_OF_REASONING_TAG)
 
-    if result:
-        valid_reward_functions = process_reward_functions(result)
+    valid_reward_functions = process_reward_functions(result) if result else []
 
     reward_functions = [
         RewardFunction(reward_func=valid_reward_function, is_generic=True, reward_weight=1.0)
@@ -432,38 +434,47 @@ async def create_synthetic_env_task(
     config: Config,
     models: AsyncGenerator[str, None],
     datasets: AsyncGenerator[Dataset, None],
+    num_environments: int = 1,
     exclude_environments: list[EnvironmentName] | None = None,
-    force_environment: EnvironmentName | None = None,
+    round_number: int = 1,
+    model_id_override: str | None = None,
+    training_start_point: TrainingStartPoint = TrainingStartPoint.DEFAULT,
+    environment_names_override: list[EnvironmentName] | None = None,
+    eval_seed_override: int | None = None,
+    exclude_models: list[str] | None = None,
+    hours_override: float | None = None,
 ) -> RawTask:
-    # hardoced model for now. the model and ds generators kept for signature compatibility
-    model_id = random.choice(SUPPORTED_ENV_MODELS)
-
-    # Environment tasks don't use the actual dataset - trainer generates a dummy one
-    # Use a placeholder to satisfy DB constraint
+    if model_id_override:
+        model_id = model_id_override
+    else:
+        candidates = [m for m in SUPPORTED_ENV_MODELS if m not in (exclude_models or [])]
+        model_id = random.choice(candidates or SUPPORTED_ENV_MODELS)
     dummy_dataset = "env_task_dummy_dataset"
 
-    number_of_hours = _get_training_hours_for_environment_task()
-
+    number_of_hours = hours_override or _get_training_hours_for_environment_task(round_number)
     current_time = datetime.utcnow()
     end_timestamp = current_time + timedelta(hours=number_of_hours)
 
-    if force_environment:
-        selected_environment = force_environment
+    if environment_names_override:
+        selected_environments = environment_names_override
     else:
-        game_candidates = [EnvironmentName.GIN_RUMMY, EnvironmentName.LIARS_DICE, EnvironmentName.LEDUC_POKER]
-        if exclude_environments:
-            game_candidates = [g for g in game_candidates if g not in exclude_environments]
-        selected_environment = random.choice(game_candidates)
+        all_envs = list(EnvironmentName)
+        candidates = [g for g in all_envs if g not in (exclude_environments or [])]
+        count = min(num_environments, len(candidates))
+        selected_environments = random.sample(candidates, count) if candidates else []
 
-    # Generate a random seed for evaluation reproducibility
-    eval_seed = random.randint(0, 2**31 - 1)
+    eval_seed = eval_seed_override if eval_seed_override is not None else random.randint(0, 2**31 - 1)
+
+    augmentation_config = maybe_get_augmentation_config(TaskType.ENVIRONMENTTASK)
+    weights = [EnvironmentWeight(environment=env) for env in selected_environments]
 
     augmentation_config = maybe_get_augmentation_config(TaskType.ENVIRONMENTTASK)
     task = EnvRawTask(
         model_id=model_id,
         ds=dummy_dataset,
         status=TaskStatus.PENDING,
-        environment_name=selected_environment,
+        environment_names=selected_environments,
+        environment_weights=weights,
         eval_seed=eval_seed,
         is_organic=False,
         created_at=current_time,
@@ -472,8 +483,12 @@ async def create_synthetic_env_task(
         account_id=vcst.NULL_ACCOUNT_ID,
         yarn_factor=None,
         augmentation_config=augmentation_config,
+        training_start_point=training_start_point,
     )
-    logger.info(f"New Environment task created with eval_seed={eval_seed}, augmented={augmentation_config is not None}")
+    logger.info(
+        f"New Environment task: {len(selected_environments)} envs={[e.value for e in selected_environments]}, "
+        f"eval_seed={eval_seed}, augmented={augmentation_config is not None}"
+    )
 
     task = await add_task(task, config.psql_db)
 

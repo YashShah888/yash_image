@@ -1530,7 +1530,7 @@ async def get_sibling_env_baseline_stats(
     """Find a sibling env task in the same round with matching model_id,
     matching environment_names, no augmentation, and completed baseline_stats.
 
-    Only call for env tasks where the calling task has augmentation_config=None.
+    Only called for round-1 style tasks (no per-miner starting models).
     Returns raw baseline_stats JSON dict if found, else None.
     """
     async with await psql_db.connection() as connection:

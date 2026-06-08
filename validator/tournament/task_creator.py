@@ -13,6 +13,7 @@ from validator.core.config import Config
 from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_DPO
 from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_GRPO
 from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_INSTRUCT_TEXT
+from validator.core.models import InstructTextRawTask
 from validator.core.models import RawTask
 from validator.db.sql import tasks as task_sql
 from validator.db.sql.tournaments import add_tournament_tasks
@@ -350,7 +351,7 @@ async def _create_task_by_type(
     if task_type == TaskType.IMAGETASK:
         return await create_synthetic_image_task(config, models)
     elif task_type == TaskType.INSTRUCTTEXTTASK:
-        return await create_synthetic_instruct_text_task(config, models, instruct_datasets)
+        return await create_synthetic_instruct_text_task(config, models, instruct_datasets, enable_kl=True)
     elif task_type == TaskType.DPOTASK:
         return await create_synthetic_dpo_task(config, models, dpo_datasets)
     elif task_type == TaskType.GRPOTASK:
@@ -359,7 +360,7 @@ async def _create_task_by_type(
         return await create_synthetic_env_task(config, models, instruct_datasets)
     else:
         # Default to instruct text task
-        return await create_synthetic_instruct_text_task(config, models, instruct_datasets)
+        return await create_synthetic_instruct_text_task(config, models, instruct_datasets, enable_kl=True)
 
 
 async def _get_existing_tasks(existing_tournament_tasks: list, config: Config) -> list[RawTask]:
@@ -400,7 +401,10 @@ async def _create_and_register_tournament_task(
         pair_id=pair_id,
     )
     await add_tournament_tasks([tournament_task], config.psql_db)
-    gpu_req = get_tournament_gpu_requirement(task.task_type, task.model_params_count, task.model_id)
+    gpu_req = get_tournament_gpu_requirement(
+        task.task_type, task.model_params_count, task.model_id,
+        use_kl=task.use_kl if isinstance(task, InstructTextRawTask) else False,
+    )
 
     # Format log message based on task type
     if task.task_type == TaskType.IMAGETASK:
@@ -429,7 +433,7 @@ async def _create_group_text_tasks(
         models = _get_text_models(config.keypair)
         instruct_datasets = _get_instruct_text_datasets(config.keypair, small_only=False)
     else:
-        models = _get_text_models(config.keypair, smallest_size_b=0.1, largest_size_b=4.0)
+        models = _get_text_models(config.keypair, smallest_size_b=0.1, largest_size_b=3.0)
         instruct_datasets = _get_instruct_text_datasets(config.keypair, small_only=round_data.round_number == 1)
     dpo_datasets = _get_dpo_datasets(config.keypair)
 
@@ -467,7 +471,7 @@ async def _create_single_group_text_tasks(
     created: list[RawTask] = await _get_existing_tasks(existing_tasks, config)
     for _ in range(tasks_per_group - existing_count):
         logger.info(f"    Group {group_index + 1} has {len(created)}/{tasks_per_group} task(s), creating 1 more")
-        task = await create_synthetic_instruct_text_task(config, models, instruct_datasets)
+        task = await create_synthetic_instruct_text_task(config, models, instruct_datasets, enable_kl=True)
         await _create_and_register_tournament_task(task, tournament_id, round_id, config, group_id=group_id)
         created.append(task)
 
@@ -524,7 +528,7 @@ async def _create_single_probability_task(
 ) -> RawTask:
     rand_val = random.random()
     if rand_val < instruct_prob:
-        return await create_synthetic_instruct_text_task(config, models, instruct_datasets)
+        return await create_synthetic_instruct_text_task(config, models, instruct_datasets, enable_kl=True)
     elif rand_val < (instruct_prob + dpo_prob):
         return await create_synthetic_dpo_task(config, models, dpo_datasets)
     else:
@@ -573,11 +577,11 @@ def _is_round_one_group_text_task(task: RawTask, round_id: str, group_id: str | 
 async def _create_round_one_group_text_replacement_task(config: Config) -> RawTask:
     """
     Create a replacement task that matches round-1 group text constraints:
-    - small text model pool (0.1B-4.0B)
+    - small text model pool (0.1B-3.0B)
     """
-    models = _get_text_models(config.keypair, smallest_size_b=0.1, largest_size_b=4.0)
+    models = _get_text_models(config.keypair, smallest_size_b=0.1, largest_size_b=3.0)
     instruct_datasets = _get_instruct_text_datasets(config.keypair)
-    return await create_synthetic_instruct_text_task(config, models, instruct_datasets)
+    return await create_synthetic_instruct_text_task(config, models, instruct_datasets, enable_kl=True)
 
 
 async def _create_new_text_boss_round_tasks(tournament_id: str, round_id: str, config: Config) -> list[RawTask]:

@@ -160,6 +160,10 @@ TOURNAMENT_GPU_THRESHOLD_FOR_8X_H100 = 40.0
 # Tournament task type GPU multipliers
 TOURNAMENT_DPO_GPU_MULTIPLIER = 3
 TOURNAMENT_GRPO_GPU_MULTIPLIER = 2
+# Instruct KL tasks keep a frozen reference (base) model resident alongside the
+# trainable model, so they need extra VRAM headroom — same class of overhead as
+# the GRPO reference policy.
+TOURNAMENT_KL_GPU_MULTIPLIER = 2
 MODEL_SIZE_REQUIRING_3_GPUS = 70 * 10**9
 MODEL_SIZE_REQUIRING_4_GPUS = 100 * 10**9
 
@@ -304,6 +308,16 @@ TRL_GRPO_FIELD_PROMPT = GRPO_DEFAULT_FIELD_PROMPT
 BETA_DPO = 0.1
 BETA_GRPO = 0.5
 
+# Instruct KL regularisation
+# Probability that a tournament instruct task asks miners to train with a KL term.
+INSTRUCT_KL_TASK_PROBABILITY = 0.2
+# Coefficient (beta) applied to KL(finetuned || base) when weighting the eval loss.
+# Sampled uniformly per task in [MIN, MAX], stored per-task (kl_coef) and sent to
+# miners so they can match the eval weighting. Range spans a light nudge up to an
+# aggressive pull (~half of tasks land in the aggressive upper half).
+INSTRUCT_KL_COEFFICIENT_MIN = 0.1
+INSTRUCT_KL_COEFFICIENT_MAX = 1.5
+
 # GRPO evaluation
 GRPO_INITIAL_BATCH_SIZE = 16
 GRPO_KL_BATCH_SIZE = 1
@@ -378,7 +392,7 @@ MODEL_PREP_ENABLED_BY_TASK_TYPE: dict[TaskType, bool] = {
 AUGMENTATION_ENABLED_TEXT = True  # Enable augmentations for text tasks
 AUGMENTATION_ENABLED_IMAGE = False  # Enable augmentations for image tasks
 AUGMENTATION_ENABLED_ENV = False  # Enable augmentations for environment tasks
-AUGMENTATION_PROBABILITY = 0.9  # Probability that a task gets any augmentation at all
+AUGMENTATION_PROBABILITY = 0.65  # Probability that a task gets any augmentation at all
 
 # Weighted distribution over augmentation types (normalised at runtime)
 # When an augmentation is applied, one type is chosen according to these weights
@@ -400,10 +414,10 @@ AUGMENTATION_SCOPE_WEIGHTS: dict[AugmentationScope, float] = {
 
 # Intensity ranges per augmentation type (min, max) — sampled uniformly
 AUGMENTATION_INTENSITY_RANGES: dict[AugmentationType, tuple[float, float]] = {
-    AugmentationType.GAUSSIAN_NOISE: (0.1, 0.3),
-    AugmentationType.WEIGHT_SCALING: (0.5, 2.5),
+    AugmentationType.GAUSSIAN_NOISE: (0.01, 0.3),
+    AugmentationType.WEIGHT_SCALING: (0.3, 1.7),
     AugmentationType.MAGNITUDE_PRUNING: (0.25, 0.50),
-    AugmentationType.LAYER_REINIT: (0.10, 0.30),
+    AugmentationType.LAYER_REINIT: (0.05, 0.15),
 }
 
 # Environment evaluation constants

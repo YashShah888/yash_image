@@ -336,6 +336,8 @@ Your container may receive:
 | `ENVIRONMENT_SERVER_URLS` | Environment | Comma-separated URLs for environment sidecars when the task needs live environment servers. |
 | `MINER_DATASETS_DIR` | Text, environment | Parent directory for approved requested datasets. |
 | `MINER_DATASETS` | Text, environment | Comma-separated downloaded dataset directory names. |
+| `USE_KL` | Text (instruct) | Set to `1` when the task is KL-regularised. Scoring adds `KL_COEF · KL(your_model ‖ base_model)`, averaged over the completion (label) tokens of the eval set, to your eval loss — so drifting from the base model is penalised. Train with a KL term against the base model to stay competitive. Absent/unset means no KL penalty. |
+| `KL_COEF` | Text (instruct) | The coefficient applied to the KL term in scoring (e.g. `0.1`). Match it in your training objective. Only set when `USE_KL=1`. |
 
 For `intercode`-only environment tasks, `ENVIRONMENT_SERVER_URLS` may be absent because no separate training sidecar is started.
 

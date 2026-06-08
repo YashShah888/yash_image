@@ -125,7 +125,15 @@ def organise_tournament_round(
                 f"Environment tournament requires minimum {t_cst.MIN_ENVIRONMENT_GROUP_SIZE} participants, "
                 f"got {len(nodes_copy)}"
             )
-        num_groups = math.ceil(len(nodes_copy) / t_cst.MAX_ENVIRONMENT_GROUP_SIZE)
+        # A small starting field uses a smaller group size so more contenders survive round 1.
+        # Round 1 only — later rounds keep the normal size so the bracket still converges
+        # rather than re-splitting the shrinking field into ever-smaller groups.
+        max_group_size = (
+            t_cst.SMALL_ENVIRONMENT_GROUP_SIZE
+            if round_number == 1 and len(nodes_copy) <= t_cst.SMALL_ENVIRONMENT_MAX_PARTICIPANTS
+            else t_cst.MAX_ENVIRONMENT_GROUP_SIZE
+        )
+        num_groups = math.ceil(len(nodes_copy) / max_group_size)
         while num_groups > 1 and len(nodes_copy) // num_groups < t_cst.MIN_ENVIRONMENT_GROUP_SIZE:
             num_groups -= 1
 
@@ -139,6 +147,20 @@ def organise_tournament_round(
             groups.append(Group(member_ids=group_hotkeys, task_ids=[]))
             idx += size
         return GroupRound(groups=groups, round_id=round_id, round_number=round_number)
+
+    # Small text/image tournament: at round 1 with 3..9 competitors, run a single
+    # group that plays multiple matches and advances only the top few, rather than
+    # a thin knockout (<=8) or a tiny group that still advances 8. Only applies to
+    # the first round so later rounds (e.g. a large group advancing 8 into a round
+    # of 8) are never mistaken for this format.
+    if (
+        round_number == 1
+        and tournament_type in (TournamentType.TEXT, TournamentType.IMAGE)
+        and t_cst.SMALL_TOURNAMENT_MIN_PARTICIPANTS <= len(nodes_copy) <= t_cst.SMALL_TOURNAMENT_MAX_PARTICIPANTS
+    ):
+        group_hotkeys = [node.hotkey for node in nodes_copy]
+        single_group = Group(member_ids=group_hotkeys, task_ids=[])
+        return GroupRound(groups=[single_group], round_id=round_id, round_number=round_number)
 
     if len(nodes_copy) <= t_cst.MAX_NUMBER_OF_MINERS_FOR_KNOCKOUT_ROUND:
         hotkeys = [node.hotkey for node in nodes_copy]

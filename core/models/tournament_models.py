@@ -202,6 +202,41 @@ class KnockoutRound(BaseRound):
 Round = GroupRound | KnockoutRound
 
 
+class MatchRanking(BaseModel):
+    """Competitors ranked best-first (rank 1 = lowest adjusted loss) for a single match."""
+
+    task_id: str
+    ranked_hotkeys: list[str]
+
+
+class GroupMatchStanding(BaseModel):
+    """A competitor's standing across a small tournament's matches.
+
+    Each match is ranked independently (rank 1 = lowest adjusted loss = best); a
+    competitor absent from a match (no scoreable model) is penalised one slot worse
+    than last for it. average_rank is the mean penalised rank across every match in
+    the round. A competitor that errored out of any match (matches_attended <
+    total_matches) is flagged via has_error and only advances if there aren't enough
+    error-free competitors to fill the advancing slots; summed_loss is the
+    tiebreaker among equally-clean, rank-tied competitors (smallest total wins).
+    """
+
+    hotkey: str
+    total_rank: float
+    matches_attended: int
+    total_matches: int
+    summed_loss: float
+
+    @property
+    def average_rank(self) -> float:
+        return self.total_rank / self.total_matches if self.total_matches else float("inf")
+
+    @property
+    def has_error(self) -> bool:
+        """True if the competitor failed to produce a scoreable model in some match."""
+        return self.matches_attended < self.total_matches
+
+
 class TournamentRound(BaseModel):
     round_structure: Round
     tasks: list[str] = Field(default_factory=list)

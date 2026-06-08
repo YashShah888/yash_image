@@ -14,6 +14,8 @@ import numpy as np
 
 from core.models.tournament_models import GitHubOwnerRepo
 from core.models.tournament_models import GpuRequirement
+from core.models.tournament_models import GroupMatchStanding
+from core.models.tournament_models import MatchRanking
 from core.models.tournament_models import RespondingNode
 from core.models.tournament_models import RoundType
 from core.models.tournament_models import TournamentData
@@ -1061,6 +1063,87 @@ async def get_environment_group_winners(
     return all_winners
 
 
+async def _get_small_tournament_group_winners(round_tasks: list[TournamentTask], psql_db: PSQLDB) -> list[str]:
+    """Winners for the small-tournament single group: average each competitor's rank across matches.
+
+    Each match is ranked independently (rank 1 = lowest adjusted loss = best); a competitor
+    absent from a match (no scoreable model) is penalised one slot worse than last for it.
+    A competitor that errored out of any match cannot advance over an error-free one — they
+    only fill a slot if there aren't SMALL_TOURNAMENT_ADVANCE clean competitors. Among
+    competitors in the same error tier, the lowest average rank advances; ties on average
+    rank are broken by smallest summed adjusted loss, then hotkey, for determinism.
+    """
+    # Gather each match's loss-ranking (rank 1 = lowest adjusted loss) and the per-match
+    # losses (kept for the summed-loss tiebreak).
+    match_rankings: list[MatchRanking] = []
+    match_losses: list[dict[str, float]] = []
+    competitors: set[str] = set()
+    for task in round_tasks:
+        miner_results = await get_task_results_for_ranking(task.task_id, psql_db)
+        if not miner_results:
+            logger.warning(f"No valid results for small-tournament task {task.task_id}")
+            continue
+
+        ranked_results = calculate_miner_ranking_and_scores(miner_results)
+        scored = [
+            (r.hotkey, r.adjusted_loss)
+            for r in ranked_results
+            if r.adjusted_loss is not None and not np.isnan(r.adjusted_loss)
+        ]
+        if not scored:
+            logger.warning(f"Small-tournament task {task.task_id} has no valid scores")
+            continue
+
+        scored.sort(key=lambda x: x[1])  # lowest loss is best
+        match_rankings.append(MatchRanking(task_id=task.task_id, ranked_hotkeys=[hk for hk, _ in scored]))
+        match_losses.append({hk: loss for hk, loss in scored})
+        competitors.update(hk for hk, _ in scored)
+
+    if not match_rankings:
+        logger.warning("Small-tournament group has no ranked matches - no winners")
+        return []
+
+    # Sum 1-based ranks across matches. A competitor absent from a match (no scoreable
+    # submission) is penalised one worse than last place, so failing to show is always
+    # worse than placing last in a fully-attended match. Beyond that, any competitor that
+    # missed a match (has_error) is sorted strictly below every fully-attending one, so an
+    # error-free competitor always advances over one that couldn't produce a model — the
+    # errored competitor only fills a slot if there aren't enough clean ones.
+    total_matches = len(match_rankings)
+    absent_rank = len(competitors) + 1
+    standings: dict[str, GroupMatchStanding] = {}
+    for hotkey in competitors:
+        total_rank = 0.0
+        summed_loss = 0.0
+        matches_attended = 0
+        for match, losses in zip(match_rankings, match_losses):
+            if hotkey in losses:
+                total_rank += match.ranked_hotkeys.index(hotkey) + 1
+                summed_loss += losses[hotkey]
+                matches_attended += 1
+            else:
+                total_rank += absent_rank
+        standings[hotkey] = GroupMatchStanding(
+            hotkey=hotkey,
+            total_rank=total_rank,
+            matches_attended=matches_attended,
+            total_matches=total_matches,
+            summed_loss=summed_loss,
+        )
+
+    ordered = sorted(
+        standings.values(),
+        key=lambda s: (s.has_error, s.average_rank, s.summed_loss, s.hotkey),
+    )
+    winners = [s.hotkey for s in ordered[: t_cst.SMALL_TOURNAMENT_ADVANCE]]
+    logger.info(
+        f"Small-tournament standings "
+        f"{[(s.hotkey, round(s.average_rank, 3), round(s.summed_loss, 4), s.has_error) for s in ordered]}; "
+        f"advancing top {len(winners)}: {winners}"
+    )
+    return winners
+
+
 async def get_group_winners(
     completed_round: TournamentRoundData, round_tasks: list[TournamentTask], psql_db: PSQLDB, config: Config = None
 ) -> list[str]:
@@ -1074,6 +1157,15 @@ async def get_group_winners(
 
     if is_environment:
         return await get_environment_group_winners(completed_round, round_tasks, psql_db, config)
+
+    # Small-tournament round 1 is a single group that plays multiple matches (normal
+    # groups have exactly one task each). Rank each match, combine the ranks, and
+    # advance only the best few into the knockout that decides the boss challenger.
+    # Gated to round 1 — the small format is only created there — so a normal large
+    # tournament that narrows to a single group in a later round is never misclassified.
+    distinct_groups = {task.group_id for task in round_tasks}
+    if completed_round.round_number == 1 and len(round_tasks) > 1 and len(distinct_groups) == 1:
+        return await _get_small_tournament_group_winners(round_tasks, psql_db)
 
     # Determine how many winners to advance
     if completed_round.is_final_round:

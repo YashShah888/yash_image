@@ -1,9 +1,13 @@
 """
-Environment task stats: deploy model via SGLang, play episodes against env servers.
-Self-contained — no validator imports. SGLang helpers inlined from eval_environment.py.
+Environment task stats: deploy model via SGLang, play baseline episodes.
+Pyspiel game envs run in-harness against MCTS (core.pvp — same tool-calling
+format as eval); other envs (intercode) POST episodes to their env server
+sidecar, as before. No validator imports (model-prep ships core/ only).
+SGLang helpers inlined from eval_environment.py.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import random
@@ -16,8 +20,18 @@ import time
 import aiohttp
 
 from core.constants import EnvironmentName
+from core.models.model_prep_models import EnvBaselineConfig
 from core.models.model_prep_models import EnvBaselineStats
 from core.models.model_prep_models import EnvStats
+from core.models.pvp_models import ChatCompletionConfig
+from core.pvp import constants as pvp_cst
+from core.pvp.baseline import run_mcts_baseline
+from core.pvp.baseline import supports_in_harness_baseline
+from core.pvp.sglang_launch import build_base_command
+from core.pvp.sglang_parsers import tool_call_parser_for
+from core.pvp.chat import chat_completion
+from core.pvp.chat import create_client
+from trainer.model_prep.stats import compute_weight_stats
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +45,11 @@ SGLANG_HEALTH_TIMEOUT = 600
 ENV_EVAL_TEMPERATURE = 0.0
 ENV_EVAL_TASK_TIMEOUT = 150
 CONSECUTIVE_FAILURE_LIMIT = 5
+# Per-env wall-clock budget for the in-harness baseline (soft cap: checked
+# between games, so an in-flight game can overshoot). Overrun returns a partial
+# tally instead of blowing the validator's dispatch timeout — keep
+# (num envs x budget) + startup costs under MODEL_PREP_TIMEOUT_SECONDS.
+ENV_BASELINE_TIME_BUDGET_SECONDS = float(os.getenv("MODEL_PREP_ENV_TIME_BUDGET_SECONDS", "540"))
 
 
 # --- SGLang process management (from eval_environment.py) ---
@@ -46,17 +65,11 @@ LOG_SGLANG_STDOUT = _env_bool("MODEL_PREP_LOG_SGLANG", False)
 
 
 def build_sglang_command(model_path: str, seed: int) -> str:
-    tensor_parallel = os.getenv("SGLANG_TENSOR_PARALLEL_SIZE", "1")
-    dtype = os.getenv("SGLANG_DTYPE", "float16")
     port = os.getenv("SGLANG_PORT", "30000")
-    base = (
-        "python3 -m sglang.launch_server "
-        f"--model-path {model_path} "
-        f"--host 0.0.0.0 --port {port} "
-        f"--tensor-parallel-size {tensor_parallel} "
-        f"--dtype {dtype} "
-        f"--enable-deterministic-inference --random-seed {seed}"
-    )
+    base = build_base_command(model_path, port, seed)
+    parser = tool_call_parser_for(model_path)
+    if parser:
+        base = f"{base} --tool-call-parser {parser}"
     extra = (os.getenv("SGLANG_ENV_EVAL_EXTRA_CLI") or SGLANG_EXTRA_CLI_DEFAULT).strip()
     return f"{base} {extra}" if extra else base
 
@@ -156,7 +169,7 @@ async def _play_episodes(
     task_id_max: int,
     eval_payload_extra: dict | None,
 ) -> EnvStats:
-    """Play episodes against a single environment and return summary stats.
+    """Play episodes against an env server sidecar and return summary stats.
 
     Stops early if CONSECUTIVE_FAILURE_LIMIT episodes fail in a row — the
     remaining episodes would almost certainly fail too (model hallucinating,
@@ -232,25 +245,67 @@ async def _play_episodes(
     return stats
 
 
+def _mcts_baseline_stats(
+    env_name: EnvironmentName,
+    sglang_base_url: str,
+    model_name: str,
+    model_path: str,
+    num_episodes: int,
+    eval_payload_extra: dict | None,
+) -> EnvStats:
+    """Play num_episodes baseline games of the model vs in-harness MCTS.
+
+    Uses the same tool-calling format as eval (core.pvp), so the baseline is
+    measured consistently with how the model is evaluated — no external server.
+    """
+    extra = eval_payload_extra or {}
+    mcts_simulations = extra.get("mcts_max_simulations")
+
+    config = ChatCompletionConfig(
+        inference_model=model_name,
+        # Local weights dir holds the tokenizer, so slot budgets use real tokens
+        # (model_name is only a basename and would fall back to word counting).
+        tokenizer_repo=model_path,
+        base_url=sglang_base_url,
+        temperature=ENV_EVAL_TEMPERATURE,
+        # Keep HTTP failure detection under the turn wall-clock alarm, as in eval —
+        # the model defaults (30s/10 retries) could never fit a 15s turn.
+        read_timeout=pvp_cst.PVP_HTTP_READ_TIMEOUT_SECONDS,
+        max_retries=pvp_cst.PVP_HTTP_MAX_RETRIES,
+    )
+    client = create_client(config)
+    chat_fn = functools.partial(chat_completion, client)
+
+    print(f"  {env_name.value}: playing {num_episodes} games vs MCTS...", flush=True)
+    result = run_mcts_baseline(
+        env_name=env_name,
+        chat_fn=chat_fn,
+        config=config,
+        num_games=num_episodes,
+        mcts_simulations=mcts_simulations,
+        time_budget_seconds=ENV_BASELINE_TIME_BUDGET_SECONDS,
+    )
+
+    # Per-game scores (win=1, draw=0.5, loss=0) -> the usual EnvStats summary.
+    scores = [1.0] * result.wins + [0.5] * result.draws + [0.0] * result.losses
+    stats = _build_env_stats(scores)
+    print(f"  {env_name.value}: {result.num_games} games, mean={stats.mean_score:.3f}", flush=True)
+    return stats
+
+
 # --- Main entry point ---
 
 async def compute_env_stats(
     model_path: str,
     model,
-    env_configs: dict[EnvironmentName, dict],
+    env_configs: dict[EnvironmentName, EnvBaselineConfig],
 ) -> EnvBaselineStats:
     """Compute env stats: deploy model via SGLang, play episodes against all environments.
 
-    env_configs maps EnvironmentName to a dict with keys:
-        url: str           — env server URL on bridge network
-        task_id_min: int
-        task_id_max: int
-        num_episodes: int
-        eval_payload_extra: dict | None
+    Pyspiel game envs play the in-harness MCTS baseline; other envs POST
+    episodes to their env server sidecar (cfg.url).
     """
     print("Computing weight stats...", flush=True)
-    from trainer.model_prep.stats import compute_weight_stats
-
     weight_stats = compute_weight_stats(model)
 
     sglang_cmd = build_sglang_command(model_path, seed=42)
@@ -270,23 +325,43 @@ async def compute_env_stats(
 
         await wait_for_health(sglang_local_url, "/v1/models", SGLANG_HEALTH_TIMEOUT, service_name="sglang")
 
-        print(f"SGLang ready, base_url for env servers: {sglang_base_url}", flush=True)
+        print(f"SGLang ready at {sglang_base_url}", flush=True)
         print(f"Evaluating {len(env_configs)} environments...", flush=True)
 
         async with aiohttp.ClientSession() as session:
             for env_name, cfg in env_configs.items():
-                stats = await _play_episodes(
-                    session=session,
-                    env_name=env_name,
-                    env_server_url=cfg["url"],
-                    sglang_base_url=sglang_base_url,
-                    model_name=model_name,
-                    num_episodes=cfg["num_episodes"],
-                    task_id_min=cfg["task_id_min"],
-                    task_id_max=cfg["task_id_max"],
-                    eval_payload_extra=cfg.get("eval_payload_extra"),
-                )
-                all_stats[env_name] = stats
+                # One env failing must not take down the others (or the container):
+                # it degrades to empty stats, mirroring the HTTP path's per-episode
+                # error handling.
+                try:
+                    if supports_in_harness_baseline(env_name):
+                        all_stats[env_name] = _mcts_baseline_stats(
+                            env_name=env_name,
+                            sglang_base_url=sglang_base_url,
+                            model_name=model_name,
+                            model_path=model_path,
+                            num_episodes=cfg.num_episodes,
+                            eval_payload_extra=cfg.eval_payload_extra,
+                        )
+                    elif cfg.url:
+                        all_stats[env_name] = await _play_episodes(
+                            session=session,
+                            env_name=env_name,
+                            env_server_url=cfg.url,
+                            sglang_base_url=sglang_base_url,
+                            model_name=model_name,
+                            num_episodes=cfg.num_episodes,
+                            task_id_min=cfg.task_id_min,
+                            task_id_max=cfg.task_id_max,
+                            eval_payload_extra=cfg.eval_payload_extra,
+                        )
+                    else:
+                        print(
+                            f"  {env_name.value}: no in-harness agent and no env server URL, skipping",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(f"  {env_name.value}: baseline failed: {exc!r}", flush=True)
 
     except TimeoutError:
         print("SGLang failed to start within timeout", flush=True)

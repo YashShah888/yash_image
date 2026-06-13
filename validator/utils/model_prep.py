@@ -17,7 +17,10 @@ from validator.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-MODEL_PREP_TIMEOUT_SECONDS = 3600
+# Pure httpx client timeout — the trainer waits on the container indefinitely.
+# Must comfortably exceed the summed per-env baseline budgets (soft caps; see
+# ENV_BASELINE_TIME_BUDGET_SECONDS) plus SGLang startup and any LoRA merge.
+MODEL_PREP_TIMEOUT_SECONDS = 5400
 
 
 def _build_env_configs() -> dict[EnvironmentName, EnvConfig]:

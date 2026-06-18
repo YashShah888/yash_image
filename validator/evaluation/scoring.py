@@ -637,6 +637,11 @@ async def process_miners_pool(
                 else:
                     raise ValueError(f"Unknown task type: {task.task_type}")
 
+        except EvaluationRetryableError:
+            # Transient infra failure (e.g. no eval GPU capacity). Propagate so the
+            # task is reset to pending and retried WITHOUT consuming an eval attempt,
+            # rather than being recorded as a permanent per-miner failure.
+            raise
         except Exception as e:
             logger.error(f"Error during batch evaluation: {e}", exc_info=True)
             results.extend(

@@ -164,7 +164,10 @@ MIN_MINERS_FOR_TOURN = 4  # within the small-tournament band (3..9): round 1 is 
 TOURNAMENT_PARTICIPATION_WEIGHT = 0.0001  # Weight given to active participants
 
 # Tournament weight distribution
-TOURNAMENT_SIMPLE_DECAY_BASE = 0.3  # Base for simple exponential decay (1st=1.0, 2nd=0.2, 3rd=0.04, etc.)
+# Only the top TOURNAMENT_PAID_RANKS placements earn; within them the share decays
+# geometrically by TOURNAMENT_SIMPLE_DECAY_BASE. base 0.25 over 2 paid ranks -> 80% / 20%.
+TOURNAMENT_PAID_RANKS = 2
+TOURNAMENT_SIMPLE_DECAY_BASE = 0.25  # 1st/2nd share = 80% / 20%; ranks beyond TOURNAMENT_PAID_RANKS get 0
 
 
 # General miner pool sizes

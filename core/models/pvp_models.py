@@ -95,8 +95,14 @@ class GoofspielParams(GameParams):
     returns_type: Literal["win_loss", "total_points", "point_difference"] = "win_loss"
 
 
+class ClobberParams(GameParams):
+    game: Literal["clobber"] = "clobber"
+    rows: int
+    columns: int
+
+
 AnyGameParams = Annotated[
-    LiarsDiceParams | LeducPokerParams | GinRummyParams | OthelloParams | GoofspielParams,
+    LiarsDiceParams | LeducPokerParams | GinRummyParams | OthelloParams | GoofspielParams | ClobberParams,
     Field(discriminator="game"),
 ]
 
@@ -145,7 +151,11 @@ class PvPModelSpec(PvPBaseModel):
         ),
     )
     gpu_id: int | None = Field(default=None, ge=0, description="GPU device ID. Defaults to 0 for model_a, 1 for model_b")
-    port: int | None = Field(default=None, gt=0, description="SGLang server port. Defaults to 30000 for model_a, 30001 for model_b")
+    port: int | None = Field(
+        default=None,
+        gt=0,
+        description="SGLang server port. Defaults to 30000 for model_a, 30001 for model_b",
+    )
 
 
 class PvPMatchupConfig(BaseModel):

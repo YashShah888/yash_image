@@ -17,8 +17,8 @@ import pyspiel
 from open_spiel.python.algorithms import mcts
 from pydantic import BaseModel
 
-from core.constants import ENVIRONMENT_CONFIGS
-from core.constants import EnvironmentName
+from core.constants.environments import ENVIRONMENT_CONFIGS
+from core.constants.environments import EnvironmentName
 from core.models.pvp_models import ChatCompletionConfig
 from core.models.pvp_models import ChatFn
 from core.models.pvp_models import GameOutcome

@@ -15,7 +15,7 @@ from pydantic import Field
 from pydantic import Tag
 from pydantic import model_validator
 
-from core.constants import EnvironmentName
+from core.constants.environments import EnvironmentName
 
 
 # --- Augmentation models ---
@@ -80,9 +80,8 @@ class WeightStats(BaseModel):
 # --- Per-type dataset stats ---
 
 class DatasetStatsBase(BaseModel):
-    # Full-dataset token estimate (mean tokens/record from a sample * num_records).
-    # num_records == 0 marks legacy rows where total_tokens covered only a
-    # 100-record sample — don't use those for time budgeting.
+    # Full-dataset token estimate. num_records == 0 marks legacy rows whose
+    # total_tokens covered only a small sample and should not drive time budgets.
     total_tokens: int
     num_records: int = 0
     seq_length_distribution: SeqLengthDistribution
@@ -141,6 +140,7 @@ class GrpoTrainingDynamics(TrainingDynamicsBase):
 
 class ThroughputStats(BaseModel):
     """Timed fwd+bwd on the loaded model in the prep container."""
+
     tokens_per_sec: float
     seq_len: int
     micro_batch_size: int
@@ -179,8 +179,7 @@ class GrpoBaselineStats(BaseModel):
 class EnvBaselineConfig(BaseModel):
     """Per-environment baseline config passed into the model prep container.
 
-    url is the env server sidecar; None for envs baselined in-harness (pyspiel
-    games play MCTS in-process and never touch a sidecar).
+    url is the env server sidecar; None for envs baselined in-harness.
     """
 
     url: str | None = None

@@ -15,18 +15,19 @@ from datetime import datetime
 from unittest import mock
 from uuid import uuid4
 
+import core.constants as core_cst
+import validator.tasks.synthetics.constants as synth_cst
+
 # NOTE: importing task_creator first sidesteps a pre-existing synthetic_scheduler <-> tournament
 # circular import that only triggers when synthetic_scheduler is imported first.
 import validator.tournament.task_creator  # noqa: F401
-import core.constants as core_cst
+from core.models.dataset_models import FileFormat
+from core.models.dataset_models import InstructTextDatasetType
 from core.models.payload_models import TrainRequestText
-from core.models.utility_models import FileFormat
-from core.models.utility_models import InstructTextDatasetType
-from validator.core import constants as vcst
-from validator.core.models import DpoRawTask
-from validator.core.models import InstructTextRawTask
-from validator.cycle.util_functions import prepare_text_task_request
-from validator.tasks.synthetic_scheduler import maybe_get_kl_config
+from validator.tasks.models import DpoRawTask
+from validator.tasks.models import InstructTextRawTask
+from validator.tasks.requests import prepare_text_task_request
+from validator.tasks.synthetics.scheduler import maybe_get_kl_config
 
 
 def _instruct_task(**overrides) -> InstructTextRawTask:
@@ -50,23 +51,23 @@ def _instruct_task(**overrides) -> InstructTextRawTask:
 # --- rollout gate ---------------------------------------------------------------
 
 def test_maybe_get_kl_config_enabled_below_probability():
-    with mock.patch("validator.tasks.synthetic_scheduler.random.random", return_value=0.0):
+    with mock.patch("validator.tasks.synthetics.scheduler.random.random", return_value=0.0):
         use_kl, kl_coef = maybe_get_kl_config()
     assert use_kl is True
     assert kl_coef is not None
-    assert vcst.INSTRUCT_KL_COEFFICIENT_MIN <= kl_coef <= vcst.INSTRUCT_KL_COEFFICIENT_MAX
+    assert synth_cst.INSTRUCT_KL_COEFFICIENT_MIN <= kl_coef <= synth_cst.INSTRUCT_KL_COEFFICIENT_MAX
 
 
 def test_maybe_get_kl_config_disabled_above_probability():
-    with mock.patch("validator.tasks.synthetic_scheduler.random.random", return_value=0.999):
+    with mock.patch("validator.tasks.synthetics.scheduler.random.random", return_value=0.999):
         use_kl, kl_coef = maybe_get_kl_config()
     assert use_kl is False
     assert kl_coef is None
 
 
 def test_kl_probability_and_coef_are_sane():
-    assert 0.0 <= vcst.INSTRUCT_KL_TASK_PROBABILITY <= 1.0
-    assert 0 < vcst.INSTRUCT_KL_COEFFICIENT_MIN <= vcst.INSTRUCT_KL_COEFFICIENT_MAX
+    assert 0.0 <= synth_cst.INSTRUCT_KL_TASK_PROBABILITY <= 1.0
+    assert 0 < synth_cst.INSTRUCT_KL_COEFFICIENT_MIN <= synth_cst.INSTRUCT_KL_COEFFICIENT_MAX
 
 
 # --- pivot regression: dataset carrier must stay clean --------------------------

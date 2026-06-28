@@ -10,48 +10,48 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import HTTPException
 
-import validator.core.constants as cts
+import validator.scoring.constants as cts
 import validator.tournament.constants as tourn_cst
+from core.logging import get_logger
 from core.models.payload_models import GpuRequirementSummary
 from core.models.payload_models import TournamentGpuRequirementsResponse
-from core.models.tournament_models import ActiveTournamentInfo
-from core.models.tournament_models import ActiveTournamentParticipant
-from core.models.tournament_models import ActiveTournamentsResponse
-from core.models.tournament_models import BenchmarkTimelineResponse
-from core.models.tournament_models import DetailedTournamentRoundResult
-from core.models.tournament_models import DetailedTournamentTaskScore
-from core.models.tournament_models import LatestTournamentsDetailsResponse
-from core.models.tournament_models import NextTournamentDates
-from core.models.tournament_models import NextTournamentInfo
-from core.models.tournament_models import PvPIndividualEnvScore
-from core.models.tournament_models import PvPPairEnvResult
-from core.models.tournament_models import TournamentDetailsResponse
-from core.models.tournament_models import TournamentHistoryEntry
-from core.models.tournament_models import TournamentHistoryResponse
-from core.models.tournament_models import TournamentParticipant
-from core.models.tournament_models import TournamentResultsWithWinners
-from core.models.tournament_models import TournamentStatus
-from core.models.tournament_models import TournamentType
-from core.models.utility_models import TaskStatus
-from validator.core.config import Config
-from validator.core.models import InstructTextRawTask
-from validator.core.constants import LATEST_TOURNAMENTS_CACHE_KEY
-from validator.core.constants import LATEST_TOURNAMENTS_CACHE_TTL
-from validator.core.constants import TASK_DETAILS_ENDPOINT
-from validator.core.dependencies import get_api_key
-from validator.core.dependencies import get_config
-from validator.core.weight_setting import get_tournament_burn_details
+from core.models.task_models import TaskStatus
+from validator.app.config import Config
+from validator.app.dependencies import get_api_key
+from validator.app.dependencies import get_config
 from validator.db.sql import benchmark_tasks
 from validator.db.sql import tasks as task_sql
 from validator.db.sql import tournaments as tournament_sql
-from validator.evaluation.tournament_scoring import calculate_tournament_type_scores_from_data
+from validator.infrastructure.service_constants import TASK_DETAILS_ENDPOINT
+from validator.scoring.tournaments import calculate_tournament_type_scores_from_data
+from validator.scoring.weights import get_tournament_burn_details
+from validator.tasks.models import InstructTextRawTask
+from validator.tournament.constants import LATEST_TOURNAMENTS_CACHE_KEY
+from validator.tournament.constants import LATEST_TOURNAMENTS_CACHE_TTL
+from validator.tournament.gpu_requirements import get_tournament_gpu_requirement
+from validator.tournament.models import ActiveTournamentInfo
+from validator.tournament.models import ActiveTournamentParticipant
+from validator.tournament.models import ActiveTournamentsResponse
+from validator.tournament.models import BenchmarkTimelineResponse
+from validator.tournament.models import DetailedTournamentRoundResult
+from validator.tournament.models import DetailedTournamentTaskScore
+from validator.tournament.models import LatestTournamentsDetailsResponse
+from validator.tournament.models import NextTournamentDates
+from validator.tournament.models import NextTournamentInfo
+from validator.tournament.models import PvPIndividualEnvScore
+from validator.tournament.models import PvPPairEnvResult
+from validator.tournament.models import TournamentDetailsResponse
+from validator.tournament.models import TournamentHistoryEntry
+from validator.tournament.models import TournamentHistoryResponse
+from validator.tournament.models import TournamentParticipant
+from validator.tournament.models import TournamentResultsWithWinners
+from validator.tournament.models import TournamentStatus
+from validator.tournament.models import TournamentType
 from validator.tournament.performance_calculator import calculate_boss_round_performance_differences
 from validator.tournament.performance_calculator import get_tournament_performance_data
 from validator.tournament.tournament_manager import _calculate_next_tournament_start_time
 from validator.tournament.tournament_manager import _get_tournament_schedule
 from validator.tournament.tournament_manager import get_tournament_completion_time
-from validator.tournament.gpu import get_tournament_gpu_requirement
-from validator.utils.logging import get_logger
 
 
 logger = get_logger(__name__)
@@ -117,7 +117,6 @@ async def get_tournament_details(
                     tournament_sql.get_all_scores_and_losses_for_task(task_id, config.psql_db) for task_id in task_ids
                 ]
                 winners_task = tournament_sql.get_task_winners(task_ids, config.psql_db)
-
                 pvp_pairs_tasks = []
                 pvp_individual_tasks = []
                 if is_environment_tournament:
@@ -138,13 +137,12 @@ async def get_tournament_details(
                     task_details = task_details_results[i]
                     participant_scores = scores_results[i]
                     winner = task_winners.get(str(task.task_id))
-
                     environment_names = None
                     pvp_pair_results = None
                     pvp_individual_scores = None
                     if is_environment_tournament:
                         if task_details and getattr(task_details, "environment_names", None):
-                            environment_names = [str(getattr(e, "value", e)) for e in task_details.environment_names]
+                            environment_names = [str(getattr(env, "value", env)) for env in task_details.environment_names]
                         pvp_pair_results = [
                             PvPPairEnvResult(
                                 hotkey_a=row.hotkey_a,
@@ -386,7 +384,7 @@ async def get_next_tournament_dates(
                     tournament_type=tournament_type,
                     current_round_number=current_round,
                     tournament_status="active",
-                    interval_hours=cts.TOURNAMENT_INTERVAL_HOURS,
+                    interval_hours=tourn_cst.TOURNAMENT_INTERVAL_HOURS,
                     scheduled_day_of_week=scheduled_day,
                     scheduled_hour=scheduled_hour,
                     scheduled_minute=0,
@@ -409,7 +407,7 @@ async def get_next_tournament_dates(
                     next_start_date=next_start,
                     current_round_number=1,
                     tournament_status="pending",
-                    interval_hours=cts.TOURNAMENT_INTERVAL_HOURS,
+                    interval_hours=tourn_cst.TOURNAMENT_INTERVAL_HOURS,
                     scheduled_day_of_week=scheduled_day,
                     scheduled_hour=scheduled_hour,
                     scheduled_minute=0,
@@ -445,7 +443,7 @@ async def get_next_tournament_dates(
                 next_start_date=next_start,
                 next_end_date=None,
                 tournament_status="waiting",
-                interval_hours=cts.TOURNAMENT_INTERVAL_HOURS,
+                interval_hours=tourn_cst.TOURNAMENT_INTERVAL_HOURS,
                 scheduled_day_of_week=scheduled_day,
                 scheduled_hour=scheduled_hour,
                 scheduled_minute=0,

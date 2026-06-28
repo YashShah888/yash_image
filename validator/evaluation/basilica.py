@@ -10,17 +10,17 @@ from uuid import UUID
 import basilica
 import requests
 
-from validator.core import constants as vcst
+import validator.evaluation.constants as vcst
+from core.logging import get_environment_logger
+from core.logging import get_logger
+from core.logging import update_environment_logger_labels
 from validator.db.database import PSQLDB
 from validator.db.sql import tasks as tasks_sql
+from validator.evaluation.basilica_deployments import EVAL_RESULT_STATUS_PATH
+from validator.evaluation.basilica_deployments import deployment_is_healthy
 from validator.evaluation.db_utils import persist_deployment_ids_for_repo
-from validator.evaluation.utils import EVAL_RESULT_STATUS_PATH
-from validator.evaluation.utils import _log_eval_step
-from validator.evaluation.utils import deployment_is_healthy
-from validator.evaluation.utils import log_basilica_logs_block
-from validator.utils.logging import get_environment_logger
-from validator.utils.logging import get_logger
-from validator.utils.logging import update_environment_logger_labels
+from validator.evaluation.evaluation_logging import _log_eval_step
+from validator.evaluation.evaluation_logging import log_basilica_logs_block
 
 
 logger = get_logger(__name__)
@@ -109,11 +109,9 @@ async def _poll_basilica_result(
                     return payload.get("error", "Basilica eval reported failure")
                 eval_logger.info(f"[{repo}] Poll ping: status={status}.")
             else:
-                # Non-200 (e.g. 404 deployment-not-found) — the deployment may be gone.
                 poll_failed = True
                 eval_logger.warning(f"[{repo}] poll got HTTP {response.status_code} from {deployment_name}")
         except Exception as e:
-            # Connection refused / DNS failure — the deployment is likely gone.
             poll_failed = True
             eval_logger.error(f"[{repo}] error polling Basilica result: {e}", exc_info=True)
 
@@ -124,7 +122,6 @@ async def _poll_basilica_result(
                     f"Deployment {deployment_name} appears dead: "
                     f"{consecutive_failures} consecutive failed polls"
                 )
-            # Re-check soon to confirm death quickly rather than waiting a full interval.
             next_poll_at += vcst.EVAL_BASILICA_FAILED_POLL_RECHECK_SECONDS
             continue
 
@@ -430,7 +427,13 @@ async def _deploy_basilica_eval_repo(
                 ctx.repo,
             )
             if not reserved:
-                await _delete_eval_deployment(ctx, client, deployment, resolved_deployment_name, "resolved_name_capacity_unavailable")
+                await _delete_eval_deployment(
+                    ctx,
+                    client,
+                    deployment,
+                    resolved_deployment_name,
+                    "resolved_name_capacity_unavailable",
+                )
                 raise EvaluationCapacityUnavailable(
                     f"Not enough evaluation GPU capacity for deployment {resolved_deployment_name} ({requested_gpus} GPUs)"
                 )

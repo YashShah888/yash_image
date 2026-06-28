@@ -2,11 +2,9 @@ import statistics
 
 import numpy as np
 
-from core.models.tournament_models import TaskPerformanceDifference
-from core.models.tournament_models import TournamentPerformanceData
-from core.models.utility_models import TaskType
-from validator.core import constants as cts
-from validator.core.constants import EMISSION_BURN_HOTKEY
+import validator.scoring.constants as cts
+from core.logging import get_logger
+from core.models.task_models import TaskType
 from validator.db.sql.tasks import get_task
 from validator.db.sql.tournament_performance import get_boss_round_winner_task_pairs
 from validator.db.sql.tournament_performance import get_task_scores_batch
@@ -15,10 +13,12 @@ from validator.db.sql.tournaments import count_champion_consecutive_wins_at_tour
 from validator.db.sql.tournaments import get_final_round_id
 from validator.db.sql.tournaments import get_tournament
 from validator.db.sql.tournaments import get_tournament_tasks
-from validator.evaluation.scoring import calculate_miner_ranking_and_scores
-from validator.tournament.utils import get_progressive_threshold
-from validator.tournament.utils import get_task_results_for_ranking
-from validator.utils.logging import get_logger
+from validator.scoring.constants import EMISSION_BURN_HOTKEY
+from validator.scoring.tasks import calculate_miner_ranking_and_scores
+from validator.tournament.models import TaskPerformanceDifference
+from validator.tournament.models import TournamentPerformanceData
+from validator.tournament.task_results import get_task_results_for_ranking
+from validator.tournament.thresholds import get_progressive_threshold
 
 
 logger = get_logger(__name__)
@@ -142,15 +142,14 @@ async def calculate_boss_round_performance_differences(tournament_id: str, psql_
             continue
 
         if task_obj.task_type == TaskType.ENVIRONMENTTASK:
-            # Local import breaks the weight_setting <-> performance_calculator import cycle.
-            from validator.core.weight_setting import calculate_env_perf_diff_from_win_pct
+            # Local import breaks the weights <-> performance_calculator import cycle.
+            from validator.scoring.weights import calculate_env_perf_diff_from_win_pct
 
             num_envs = len(task_obj.environment_names) if task_obj.environment_names else 1
             win_pct = (2 * challenger_score + boss_score - 3 * num_envs) / (3 * num_envs)
             perf_diff = calculate_env_perf_diff_from_win_pct(win_pct)
             challenger_won = challenger_score > boss_score
         elif is_higher_better:
-            # abs() so the relative margin keeps its sign for negative scores (e.g. GRPO rewards)
             if boss_score != 0:
                 perf_diff = (challenger_score - boss_score) / abs(boss_score)
             else:
@@ -205,7 +204,8 @@ async def get_tournament_performance_data(tournament_id: str, psql_db) -> list[T
 
     for i, task_pair in enumerate(task_pairs):
         logger.info(
-            f"Processing task pair {i + 1}/{len(task_pairs)}: tournament={task_pair.tournament_task_id}, synthetic={task_pair.synthetic_task_id}, winner={task_pair.winner_hotkey}"
+            f"Processing task pair {i + 1}/{len(task_pairs)}: tournament={task_pair.tournament_task_id}, "
+            f"synthetic={task_pair.synthetic_task_id}, winner={task_pair.winner_hotkey}"
         )
 
         tournament_scores = all_scores.get(task_pair.tournament_task_id, [])
@@ -272,7 +272,8 @@ async def get_tournament_performance_data(tournament_id: str, psql_db) -> list[T
         else:
             if winner_tournament_score is None and best_synthetic_score is not None:
                 logger.warning(
-                    f"Winner {task_pair.winner_hotkey} has no score in tournament task but synthetic miners do - applying max burn reduction"
+                    f"Winner {task_pair.winner_hotkey} has no score in tournament task but synthetic miners do "
+                    "- applying max burn reduction"
                 )
                 performance_diff = cts.MAX_BURN_REDUCTION / cts.BURN_REDUCTION_RATE
 

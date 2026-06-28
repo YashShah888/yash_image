@@ -1,8 +1,8 @@
 """Tokenizer-backed TokenCounter so memory slot budgets are real model tokens.
 
 memory.py stays dependency-free (whitespace counter, fine for tests and as a
-fallback). This module pulls in transformers and is imported only where a real
-tokenizer is wanted (the eval harness), so the pure core stays light.
+fallback). Transformers is imported lazily so pure tests and callers can still
+use the whitespace fallback when optional tokenizer dependencies are unavailable.
 """
 
 from __future__ import annotations
@@ -11,13 +11,21 @@ import logging
 import os
 from typing import Literal
 
-from transformers import AutoTokenizer
-
 from core.pvp.memory import TokenCounter
 from core.pvp.memory import WhitespaceTokenCounter
 
 
 logger = logging.getLogger(__name__)
+AutoTokenizer = None
+
+
+def _get_auto_tokenizer():
+    global AutoTokenizer
+    if AutoTokenizer is None:
+        from transformers import AutoTokenizer as _AutoTokenizer
+
+        AutoTokenizer = _AutoTokenizer
+    return AutoTokenizer
 
 
 class HFTokenCounter:
@@ -47,7 +55,7 @@ def load_token_counter(model_repo: str) -> TokenCounter:
     if "/" not in model_repo and not os.path.exists(model_repo):
         return WhitespaceTokenCounter()
     try:
-        return HFTokenCounter(AutoTokenizer.from_pretrained(model_repo))
+        return HFTokenCounter(_get_auto_tokenizer().from_pretrained(model_repo))
     except Exception as exc:
         logger.warning("Tokenizer load failed for %r (%s); using whitespace counter", model_repo, exc)
         return WhitespaceTokenCounter()

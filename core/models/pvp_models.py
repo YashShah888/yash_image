@@ -12,7 +12,7 @@ from typing import Protocol
 from pydantic import BaseModel
 from pydantic import Field
 
-from core.constants import EnvironmentName
+from core.constants.environments import EnvironmentName
 
 
 class PvPIncompleteError(Exception):
@@ -52,14 +52,7 @@ class GameScoringContext(BaseModel):
 
 
 class GameParams(BaseModel):
-    """Base for a game's pyspiel.load_game() parameters.
-
-    Each game has its own subclass with just the fields it accepts; the `game`
-    discriminator makes them a tagged union so a GameInstance round-trips to the
-    right subclass. to_pyspiel() renders the kwargs dict, dropping the tag (which
-    is ours, not a pyspiel parameter). Subclasses declare the `game` tag; the
-    base omits it so each subclass owns its literal.
-    """
+    """Base for a game's pyspiel.load_game parameters."""
 
     def to_pyspiel(self) -> dict[str, int | str | bool]:
         return self.model_dump(exclude={"game"})
@@ -86,6 +79,12 @@ class OthelloParams(GameParams):
     game: Literal["othello"] = "othello"
 
 
+class ClobberParams(GameParams):
+    game: Literal["clobber"] = "clobber"
+    rows: int
+    columns: int
+
+
 class GoofspielParams(GameParams):
     game: Literal["goofspiel"] = "goofspiel"
     players: int = 2
@@ -95,14 +94,8 @@ class GoofspielParams(GameParams):
     returns_type: Literal["win_loss", "total_points", "point_difference"] = "win_loss"
 
 
-class ClobberParams(GameParams):
-    game: Literal["clobber"] = "clobber"
-    rows: int
-    columns: int
-
-
 AnyGameParams = Annotated[
-    LiarsDiceParams | LeducPokerParams | GinRummyParams | OthelloParams | GoofspielParams | ClobberParams,
+    LiarsDiceParams | LeducPokerParams | GinRummyParams | OthelloParams | ClobberParams | GoofspielParams,
     Field(discriminator="game"),
 ]
 
@@ -147,14 +140,14 @@ class PvPModelSpec(PvPBaseModel):
         description=(
             "Adapter repos to merge onto `original_model` before applying `repo`, so a "
             "continuation miner is served on the base it actually trained on. Empty for "
-            "round-1 models. A list (not a single repo) to support deeper chains."
+            "round-1 models. A list supports deeper chains."
         ),
     )
-    gpu_id: int | None = Field(default=None, ge=0, description="GPU device ID. Defaults to 0 for model_a, 1 for model_b")
+    gpu_id: int | None = Field(
+        default=None, ge=0, description="GPU device ID. Defaults to 0 for model_a, 1 for model_b"
+    )
     port: int | None = Field(
-        default=None,
-        gt=0,
-        description="SGLang server port. Defaults to 30000 for model_a, 30001 for model_b",
+        default=None, gt=0, description="SGLang server port. Defaults to 30000 for model_a, 30001 for model_b"
     )
 
 
@@ -163,7 +156,10 @@ class PvPMatchupConfig(BaseModel):
 
     time_budget_seconds: float = Field(
         gt=0,
-        description="Wall-clock budget for this environment. Seed pairs (2 games each) are played until the budget expires or an early forfeit fires.",
+        description=(
+            "Wall-clock budget for this environment. Seed pairs (2 games each) are played until the budget "
+            "expires or an early forfeit fires."
+        ),
     )
 
 

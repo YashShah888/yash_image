@@ -11,35 +11,36 @@ import tempfile
 import time
 from pathlib import Path
 
-from core.models.tournament_models import DedupClusterRecord
-from core.models.tournament_models import DedupPairVerdict
-from core.models.tournament_models import DedupResult
-from core.models.tournament_models import DedupReviewStatus
-from core.models.tournament_models import GateDecision
-from core.models.tournament_models import RepoRef
-from core.models.tournament_models import PublishedRepo
-from core.models.tournament_models import TournamentData
-from core.models.tournament_models import TournamentDedupReview
-from core.models.tournament_models import TournamentRoundData
-from core.models.tournament_models import generate_round_id
-from validator.core import constants as cst
-from validator.core.config import Config
+from core.constants.credentials import BUCKET_NAME
+from core.logging import get_logger
+from validator.app.config import Config
 from validator.db.database import PSQLDB
 from validator.db.sql.dedup import get_dedup_review
 from validator.db.sql.dedup import insert_dedup_review
 from validator.db.sql.dedup import mark_dedup_review_resolved
 from validator.db.sql.tournaments import eliminate_tournament_participants
 from validator.db.sql.tournaments import get_tournament_participants
+from validator.infrastructure.repo_dedup import find_hash_duplicates
+from validator.infrastructure.repo_dedup import render_report
+from validator.infrastructure.repo_dedup import run_pairwise_dedup
+from validator.scoring.constants import EMISSION_BURN_HOTKEY
+from validator.tasks.details import upload_file_to_minio
+from validator.tournament.models import DedupClusterRecord
+from validator.tournament.models import DedupPairVerdict
+from validator.tournament.models import DedupResult
+from validator.tournament.models import DedupReviewStatus
+from validator.tournament.models import GateDecision
+from validator.tournament.models import PublishedRepo
+from validator.tournament.models import RepoRef
+from validator.tournament.models import TournamentData
+from validator.tournament.models import TournamentDedupReview
+from validator.tournament.models import TournamentRoundData
+from validator.tournament.models import generate_round_id
+from validator.tournament.notifications import notify_tournament_dedup_autoremoved
+from validator.tournament.notifications import notify_tournament_dedup_error
+from validator.tournament.notifications import notify_tournament_dedup_resolved
+from validator.tournament.notifications import notify_tournament_dedup_review
 from validator.tournament.repo_uploader import upload_flagged_duplicate_repository
-from validator.tournament.utils import notify_tournament_dedup_autoremoved
-from validator.tournament.utils import notify_tournament_dedup_error
-from validator.tournament.utils import notify_tournament_dedup_resolved
-from validator.tournament.utils import notify_tournament_dedup_review
-from validator.utils.logging import get_logger
-from validator.utils.repo_dedup import find_hash_duplicates
-from validator.utils.repo_dedup import render_report
-from validator.utils.repo_dedup import run_pairwise_dedup
-from validator.utils.util import upload_file_to_minio
 
 
 logger = get_logger(__name__)
@@ -66,7 +67,12 @@ def _to_records(result: DedupResult) -> tuple[list[DedupClusterRecord], list[Ded
     clusters = [DedupClusterRecord(members=c.members, basis=c.basis, reason=c.reason) for c in result.clusters]
     verdicts = [
         DedupPairVerdict(
-            hotkey_a=v.hotkey_a, hotkey_b=v.hotkey_b, tier=v.tier, relationship=v.relationship, confidence=v.confidence, reason=v.reason
+            hotkey_a=v.hotkey_a,
+            hotkey_b=v.hotkey_b,
+            tier=v.tier,
+            relationship=v.relationship,
+            confidence=v.confidence,
+            reason=v.reason,
         )
         for v in result.pair_verdicts
     ]
@@ -74,10 +80,10 @@ def _to_records(result: DedupResult) -> tuple[list[DedupClusterRecord], list[Ded
 
 
 async def _upload_report(result: DedupResult, tournament: TournamentData, round_id: str) -> str | None:
-    if not cst.BUCKET_NAME:
+    if not BUCKET_NAME:
         logger.warning("S3_BUCKET_NAME not set; skipping dedup report upload")
         return None
-    report = render_report(result, tournament.tournament_id, round_id, cst.EMISSION_BURN_HOTKEY)
+    report = render_report(result, tournament.tournament_id, round_id, EMISSION_BURN_HOTKEY)
     temp_dir = Path(tempfile.mkdtemp(prefix="dedup-report-"))
     try:
         path = temp_dir / "dedup_report.md"
@@ -86,7 +92,7 @@ async def _upload_report(result: DedupResult, tournament: TournamentData, round_
             f"tournament-dedup-reports/{tournament.tournament_type.value}/"
             f"{tournament.tournament_id}-{round_id}-{int(time.time())}.md"
         )
-        return await upload_file_to_minio(str(path), cst.BUCKET_NAME, object_name)
+        return await upload_file_to_minio(str(path), BUCKET_NAME, object_name)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -100,7 +106,7 @@ async def detect_r1_hash_duplicates(tournament: TournamentData, candidate_hotkey
     if len(refs) < 2:
         return DedupResult(cohort=[r.hotkey for r in refs])
     logger.info(f"R1 hash dedup: checking {len(refs)} repos for tournament {tournament.tournament_id}")
-    return await find_hash_duplicates(refs, boss_hotkey=cst.EMISSION_BURN_HOTKEY)
+    return await find_hash_duplicates(refs, boss_hotkey=EMISSION_BURN_HOTKEY)
 
 
 async def apply_r1_eliminations(
@@ -152,7 +158,7 @@ async def evaluate_r2_dedup_gate(
         return GateDecision(halt=False)
 
     # APPROVED
-    eliminate = {h for h in existing.approved_eliminations if h != cst.EMISSION_BURN_HOTKEY}
+    eliminate = {h for h in existing.approved_eliminations if h != EMISSION_BURN_HOTKEY}
     if existing.resolved_at is not None:
         return GateDecision(halt=False, eliminate=eliminate)
     await _apply_approved_gate(tournament, completed_round, existing, eliminate, config, psql_db)
@@ -168,12 +174,12 @@ async def _run_and_record_gate(
         return GateDecision(halt=False)
 
     logger.info(f"Dedup gate {next_round_id}: running Claude pairwise check on {len(refs)} R2 entrants")
-    result = await run_pairwise_dedup(refs, boss_hotkey=cst.EMISSION_BURN_HOTKEY)
+    result = await run_pairwise_dedup(refs, boss_hotkey=EMISSION_BURN_HOTKEY)
     clusters, verdicts = _to_records(result)
 
     unresolved_note = None
     if result.unresolved_pairs:
-        unresolved_note = "Judge returned no verdict for (skipped — manual check needed): " + ", ".join(
+        unresolved_note = "Judge returned no verdict for (skipped; manual check needed): " + ", ".join(
             f"{a[:8]} vs {b[:8]}" for a, b in result.unresolved_pairs
         )
 

@@ -3,15 +3,15 @@ from uuid import UUID
 from asyncpg.connection import Connection
 
 import validator.db.constants as cst
-from core.constants import NETUID
-from core.models.utility_models import TaskStatus
-from validator.core.models import AllNodeStats
-from validator.core.models import ModelMetrics
-from validator.core.models import NodeStats
-from validator.core.models import QualityMetrics
-from validator.core.models import Submission
-from validator.core.models import WorkloadMetrics
+from core.constants.network import NETUID
+from core.models.task_models import TaskStatus
 from validator.db.database import PSQLDB
+from validator.nodes.models import AllNodeStats
+from validator.nodes.models import ModelMetrics
+from validator.nodes.models import NodeStats
+from validator.nodes.models import QualityMetrics
+from validator.nodes.models import WorkloadMetrics
+from validator.scoring.models import Submission
 
 
 async def add_submission(submission: Submission, psql_db: PSQLDB) -> Submission:

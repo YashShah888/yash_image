@@ -4,32 +4,27 @@ import random
 import uuid
 from uuid import UUID
 
-from core import constants as cst
+import core.constants.docker as docker_cst
+import core.constants.environments as env_cst
+import validator.evaluation.constants as vcst
+from core.logging import get_environment_logger
+from core.logging import get_logger
+from core.logging import update_environment_logger_labels
+from core.models.dataset_models import ChatTemplateDatasetType
+from core.models.dataset_models import DpoDatasetType
+from core.models.dataset_models import EnvironmentDatasetType
+from core.models.dataset_models import FileFormat
+from core.models.dataset_models import GrpoDatasetType
+from core.models.dataset_models import InstructTextDatasetType
+from core.models.image_models import ImageModelType
 from core.models.payload_models import DockerEvaluationResults
-from core.models.pvp_models import PvPEvalConfig
-from core.models.pvp_models import PvPEvalResults
-from core.models.pvp_models import PvPGroupResults
-from core.models.pvp_models import PvPMatchupConfig
-from core.models.pvp_models import PvPMode
-from core.models.pvp_models import PvPModelSpec
-from core.models.pvp_models import PvPPairResult
-from core.models.scoring_models import IndividualEvalResult
-from core.models.scoring_models import MinerRepos
-from core.models.utility_models import ChatTemplateDatasetType
-from core.models.utility_models import DpoDatasetType
-from core.models.utility_models import EnvironmentDatasetType
-from core.models.utility_models import FileFormat
-from core.models.utility_models import GrpoDatasetType
-from core.models.utility_models import ImageModelType
-from core.models.utility_models import InstructTextDatasetType
-from core.models.utility_models import TaskType
-from validator.core import constants as vcst
+from core.models.task_models import TaskType
 from validator.db.database import PSQLDB
 from validator.db.sql import tasks as tasks_sql
 from validator.db.sql import tournaments as tournament_sql
-from validator.evaluation.basilica import _BasilicaEvalContext
 from validator.evaluation.basilica import EvaluationCapacityUnavailable
 from validator.evaluation.basilica import EvaluationRetryableError
+from validator.evaluation.basilica import _BasilicaEvalContext
 from validator.evaluation.basilica import _db_call_with_retry
 from validator.evaluation.basilica import _delete_eval_deployment
 from validator.evaluation.basilica import _deploy_with_readiness_timeout
@@ -38,16 +33,23 @@ from validator.evaluation.basilica import _get_healthy_existing_basilica_deploym
 from validator.evaluation.basilica import _poll_eval_deployment
 from validator.evaluation.basilica import _release_reserved_gpus
 from validator.evaluation.basilica import run_basilica_eval_repos
+from validator.evaluation.basilica_deployments import create_basilica_eval_runner_source
 from validator.evaluation.db_utils import load_eval_pair_state_for_models
 from validator.evaluation.db_utils import load_shared_eval_deployment_id
 from validator.evaluation.db_utils import persist_shared_eval_deployment_id
-from validator.evaluation.utils import _log_eval_step
-from validator.evaluation.utils import create_basilica_eval_runner_source
-from validator.evaluation.utils import normalize_rewards_and_compute_loss
-from validator.evaluation.utils import process_evaluation_results
-from validator.utils.logging import get_environment_logger
-from validator.utils.logging import get_logger
-from validator.utils.logging import update_environment_logger_labels
+from validator.evaluation.evaluation_logging import _log_eval_step
+from validator.evaluation.pvp.models import PvPEvalConfig
+from validator.evaluation.pvp.models import PvPEvalResults
+from validator.evaluation.pvp.models import PvPGroupResults
+from validator.evaluation.pvp.models import PvPMatchupConfig
+from validator.evaluation.pvp.models import PvPMode
+from validator.evaluation.pvp.models import PvPModelSpec
+from validator.evaluation.pvp.models import PvPPairResult
+from validator.evaluation.result_processing import normalize_rewards_and_compute_loss
+from validator.evaluation.result_processing import process_evaluation_results
+from validator.scoring.models import IndividualEvalResult
+from validator.scoring.models import MinerRepos
+from validator.tasks.datasets.constants import CONTAINER_EVAL_RESULTS_PATH
 
 
 try:
@@ -63,7 +65,7 @@ def _deployment_url(deployment) -> str | None:
     return getattr(deployment, "url", None)
 
 
-def _first_environment_name(dataset_type: EnvironmentDatasetType) -> cst.EnvironmentName | None:
+def _first_environment_name(dataset_type: EnvironmentDatasetType) -> env_cst.EnvironmentName | None:
     environment_names = dataset_type.environment_names or []
     return environment_names[0] if environment_names else None
 
@@ -142,17 +144,17 @@ async def run_evaluation_basilica_text(
     is_environment_eval = isinstance(dataset_type, EnvironmentDatasetType)
     environment_name = _first_environment_name(dataset_type) if is_environment_eval else None
     environment_name_value = getattr(environment_name, "value", environment_name)
-    is_intercode_eval = is_environment_eval and environment_name_value == cst.EnvironmentName.INTERCODE.value
+    is_intercode_eval = is_environment_eval and environment_name_value == env_cst.EnvironmentName.INTERCODE.value
     if is_intercode_eval:
-        basilica_image = cst.VALIDATOR_DOCKER_IMAGE_INTERCODE
+        basilica_image = docker_cst.VALIDATOR_DOCKER_IMAGE_INTERCODE
     elif is_environment_eval:
-        basilica_image = cst.VALIDATOR_DOCKER_IMAGE_ENV
+        basilica_image = docker_cst.VALIDATOR_DOCKER_IMAGE_ENV
     else:
-        basilica_image = cst.VALIDATOR_DOCKER_IMAGE
+        basilica_image = docker_cst.VALIDATOR_DOCKER_IMAGE
     if isinstance(dataset_type, (InstructTextDatasetType, ChatTemplateDatasetType)):
-        command = ["python", "-m", "validator.evaluation.eval_instruct_text"]
+        command = ["python", "-m", "validator.evaluation.evaluators.instruct_text"]
     elif isinstance(dataset_type, DpoDatasetType):
-        command = ["python", "-m", "validator.evaluation.eval_dpo"]
+        command = ["python", "-m", "validator.evaluation.evaluators.dpo"]
     elif isinstance(dataset_type, GrpoDatasetType):
         return await run_evaluation_basilica_grpo(
             dataset, models, original_model, dataset_type, file_format, num_gpus,
@@ -162,9 +164,9 @@ async def run_evaluation_basilica_text(
         )
     elif isinstance(dataset_type, EnvironmentDatasetType):
         if is_intercode_eval:
-            command = ["python", "-m", "validator.evaluation.eval_intercode"]
+            command = ["python", "-m", "validator.evaluation.evaluators.intercode"]
         else:
-            command = ["python", "-m", "validator.evaluation.eval_environment"]
+            command = ["python", "-m", "validator.evaluation.evaluators.environment"]
     else:
         raise ValueError(f"Unsupported dataset type: {type(dataset_type)}")
     if not is_environment_eval and not dataset.startswith("http://") and not dataset.startswith("https://"):
@@ -173,7 +175,7 @@ async def run_evaluation_basilica_text(
             "Use validator.evaluation.local_evaluation.run_evaluation_docker_text for local file paths."
         )
     dataset_type_str = dataset_type.model_dump_json()
-    source = create_basilica_eval_runner_source(command, cst.CONTAINER_EVAL_RESULTS_PATH)
+    source = create_basilica_eval_runner_source(command, CONTAINER_EVAL_RESULTS_PATH)
 
     base_env = {
         "ORIGINAL_MODEL": original_model,
@@ -183,13 +185,13 @@ async def run_evaluation_basilica_text(
         **vcst.HF_CONTAINER_ENV,
     }
     if use_kl:
-        base_env[cst.USE_KL_ENV] = "1"
+        base_env[docker_cst.USE_KL_ENV] = "1"
         if kl_coef is not None:
-            base_env[cst.KL_COEF_ENV] = str(kl_coef)
+            base_env[docker_cst.KL_COEF_ENV] = str(kl_coef)
     if is_environment_eval:
-        env_name = cst.EnvironmentName(environment_name_value) if environment_name_value else None
-        if env_name not in cst.ENVIRONMENT_CONFIGS:
-            raise ValueError(f"Environment '{env_name}' not found. Supported: {[e.value for e in cst.EnvironmentName]}")
+        env_name = env_cst.EnvironmentName(environment_name_value) if environment_name_value else None
+        if env_name not in env_cst.ENVIRONMENT_CONFIGS:
+            raise ValueError(f"Environment '{env_name}' not found. Supported: {[e.value for e in env_cst.EnvironmentName]}")
         base_seed = eval_seed if eval_seed is not None else vcst.ENV_EVAL_DEFAULT_SEED
         base_env["ENVIRONMENT_NAME"] = env_name.value
         base_env["EVAL_SEED"] = str(base_seed)
@@ -252,14 +254,14 @@ async def run_evaluation_basilica_grpo(
     """
     Run GRPO evaluation on Basilica with separate deployments per repo.
     """
-    command = ["python", "-m", "validator.evaluation.eval_grpo"]
+    command = ["python", "-m", "validator.evaluation.evaluators.grpo"]
     if not dataset.startswith("http://") and not dataset.startswith("https://"):
         raise ValueError(
             "Basilica GRPO eval expects dataset to be an S3/HTTP URL. "
             "Use validator.evaluation.local_evaluation.run_evaluation_docker_grpo for local file paths."
         )
     dataset_type_str = dataset_type.model_dump_json()
-    source = create_basilica_eval_runner_source(command, cst.CONTAINER_EVAL_RESULTS_PATH)
+    source = create_basilica_eval_runner_source(command, CONTAINER_EVAL_RESULTS_PATH)
 
     base_environment = {
         "ORIGINAL_MODEL": original_model,
@@ -283,7 +285,7 @@ async def run_evaluation_basilica_grpo(
         repos=models,
         model_name=original_model,
         task_type="grpo",
-        image=cst.VALIDATOR_DOCKER_IMAGE,
+        image=docker_cst.VALIDATOR_DOCKER_IMAGE,
         source=source,
         build_env_for_repo=build_env_for_repo,
         gpu_count=max(1, num_gpus),
@@ -320,7 +322,7 @@ async def run_evaluation_basilica_image(
     if not test_split_url.startswith("http://") and not test_split_url.startswith("https://"):
         raise ValueError("Basilica image eval expects TEST_SPLIT_URL to be an S3/HTTP URL.")
     command = ["/app/start.sh"]
-    source = create_basilica_eval_runner_source(command, cst.CONTAINER_EVAL_RESULTS_PATH)
+    source = create_basilica_eval_runner_source(command, CONTAINER_EVAL_RESULTS_PATH)
 
     base_env = {
         "ORIGINAL_MODEL_REPO": original_model_repo,
@@ -407,7 +409,7 @@ async def _deploy_pvp_eval(
     Shared by PvP pair eval calls.
     """
     hotkeys = hotkeys or []
-    image = image or cst.VALIDATOR_DOCKER_IMAGE_PVP
+    image = image or docker_cst.VALIDATOR_DOCKER_IMAGE_PVP
     gpu_count = gpu_count or vcst.PVP_BASILICA_GPU_COUNT
     env = {
         vcst.PVP_CONFIG_ENV_VAR: pvp_config.model_dump_json(),
@@ -468,8 +470,6 @@ async def _deploy_pvp_eval(
                 max_poll_seconds=vcst.PVP_BASILICA_TTL_SECONDS,
             )
             if isinstance(result, dict):
-                # Pair finished — free its GPU reservation now instead of waiting for the
-                # whole task's cleanup, so the slot is reusable immediately.
                 await _release_reserved_gpus(
                     task_id=task_id,
                     psql_db=psql_db,
@@ -604,8 +604,6 @@ async def _deploy_pvp_eval(
                 max_poll_seconds=vcst.PVP_BASILICA_TTL_SECONDS,
             )
             if isinstance(result, dict):
-                # Pair finished — free its GPU reservation now instead of waiting for the
-                # whole task's cleanup, so the slot is reusable immediately.
                 await _release_reserved_gpus(
                     task_id=task_id,
                     psql_db=psql_db,
@@ -654,7 +652,7 @@ async def _deploy_pvp_eval(
 async def run_evaluation_individual(
     miners: MinerRepos,
     base_model: str,
-    environment_name: cst.EnvironmentName,
+    environment_name: env_cst.EnvironmentName,
     seed: int,
     image: str,
     gpu_count: int,
@@ -667,13 +665,13 @@ async def run_evaluation_individual(
     Each miner gets its own container. The container runs one model and returns
     a score via the standard eval_loss result format.
 
-    base_chains maps hotkey -> base_chain, piped to the container as BASE_CHAIN.
+    base_chains maps hotkey -> adapter lineage, piped to the container as BASE_CHAIN.
     """
-    env_config = cst.ENVIRONMENT_CONFIGS[environment_name]
+    env_config = env_cst.ENVIRONMENT_CONFIGS[environment_name]
     if not env_config.tournament_eval_command:
         raise ValueError(f"No tournament_eval_command configured for {environment_name.value}")
     command = env_config.tournament_eval_command
-    source = create_basilica_eval_runner_source(command, cst.CONTAINER_EVAL_RESULTS_PATH)
+    source = create_basilica_eval_runner_source(command, CONTAINER_EVAL_RESULTS_PATH)
 
     base_env = {
         "ORIGINAL_MODEL": base_model,
@@ -716,7 +714,7 @@ async def run_evaluation_individual(
         if isinstance(result, dict):
             inner = result.get(repo, result)
             if isinstance(inner, dict):
-                scores[hotkey] = float(inner.get(cst.CONTAINER_EVAL_SCORE_KEY, 0.0))
+                scores[hotkey] = float(inner.get("eval_loss", 0.0))
             else:
                 logger.warning(f"Individual eval unexpected result for {repo}: {inner}")
         else:
@@ -734,7 +732,7 @@ async def run_evaluation_pvp_pair(
     hotkey_a: str,
     hotkey_b: str,
     base_model: str,
-    environment_names: list[cst.EnvironmentName],
+    environment_names: list[env_cst.EnvironmentName],
     seed: int,
     image: str | None = None,
     gpu_count: int | None = None,
@@ -748,8 +746,7 @@ async def run_evaluation_pvp_pair(
 
     Returns PvPGroupResults (single pair) for consistent downstream processing.
 
-    base_chain_a/base_chain_b are each miner's continuation lineage (adapter repos to
-    merge onto base_model before the miner's own adapter); empty for round-1 models.
+    base_chain_a/base_chain_b reconstruct continuation miners' trained bases.
     """
     matchups = {
         env: PvPMatchupConfig(time_budget_seconds=vcst.PVP_MATCHUP_TIME_BUDGET_SECONDS)

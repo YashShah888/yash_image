@@ -5,32 +5,32 @@ from uuid import UUID
 from asyncpg.connection import Connection
 from fiber.chain.models import Node
 
-import validator.core.constants as core_cst
 import validator.db.constants as cst
-from core.constants import NETUID
-from core.models.utility_models import ImageTextPair
-from core.models.utility_models import TaskStatus
-from core.models.utility_models import TaskType
-from validator.core.models import AnyTypeRawTask
-from validator.core.models import AnyTypeTask
-from validator.core.models import ChatRawTask
-from validator.core.models import ChatTask
-from validator.core.models import DetailedNetworkStats
-from validator.core.models import DpoRawTask
-from validator.core.models import DpoTask
-from validator.core.models import GrpoRawTask
-from validator.core.models import GrpoTask
-from validator.core.models import EnvTask
-from validator.core.models import EnvRawTask
-from validator.core.models import ImageRawTask
-from validator.core.models import ImageTask
-from validator.core.models import InstructTextRawTask
-from validator.core.models import InstructTextTask
-from validator.core.models import NetworkStats
-from validator.core.models import RewardFunction
+import validator.lifecycle.constants as lifecycle_cst
+from core.constants.network import NETUID
+from core.logging import get_logger
+from core.models.dataset_models import ImageTextPair
+from core.models.reward_models import RewardFunction
+from core.models.task_models import TaskStatus
+from core.models.task_models import TaskType
 from validator.db.database import PSQLDB
-from validator.utils.logging import get_logger
-from validator.utils.minio import async_minio_client
+from validator.infrastructure.minio_client import async_minio_client
+from validator.tasks.models import AnyTypeRawTask
+from validator.tasks.models import AnyTypeTask
+from validator.tasks.models import ChatRawTask
+from validator.tasks.models import ChatTask
+from validator.tasks.models import DetailedNetworkStats
+from validator.tasks.models import DpoRawTask
+from validator.tasks.models import DpoTask
+from validator.tasks.models import EnvRawTask
+from validator.tasks.models import EnvTask
+from validator.tasks.models import GrpoRawTask
+from validator.tasks.models import GrpoTask
+from validator.tasks.models import ImageRawTask
+from validator.tasks.models import ImageTask
+from validator.tasks.models import InstructTextRawTask
+from validator.tasks.models import InstructTextTask
+from validator.tasks.models import NetworkStats
 
 
 logger = get_logger(__name__)
@@ -1082,6 +1082,7 @@ async def get_task_by_id(task_id: UUID, psql_db: PSQLDB) -> AnyTypeTask:
                 SELECT
                     tasks.*,
                     it.model_type,
+                    it.trigger_word,
                     victorious_repo.repo as trained_model_repository
                 FROM {cst.TASKS_TABLE} tasks
                 LEFT JOIN {cst.IMAGE_TASKS_TABLE} it ON tasks.{cst.TASK_ID} = it.{cst.TASK_ID}
@@ -1385,7 +1386,7 @@ async def get_tasks_by_account_id(psql_db: PSQLDB, account_id: UUID, limit: int 
 
             elif task_type == TaskType.IMAGETASK.value:
                 image_query = f"""
-                    SELECT {cst.MODEL_TYPE}
+                    SELECT {cst.MODEL_TYPE}, {cst.TRIGGER_WORD}
                     FROM {cst.IMAGE_TASKS_TABLE}
                     WHERE {cst.TASK_ID} = $1
                 """
@@ -1871,7 +1872,7 @@ async def try_reserve_evaluation_gpus(
                 NETUID,
                 ["pending", "evaluating"],
             )
-            if int(active_gpus or 0) + requested_gpus > core_cst.EVAL_MAX_GPUS:
+            if int(active_gpus or 0) + requested_gpus > lifecycle_cst.EVAL_MAX_GPUS:
                 return False
 
             result = await connection.execute(
@@ -2059,7 +2060,13 @@ async def add_reward_functions(task_id: UUID, reward_functions: list[RewardFunct
 async def get_reward_functions(task_id: UUID, psql_db: PSQLDB, connection: Connection | None = None) -> list[RewardFunction]:
     async def _get_reward_functions(conn: Connection) -> list[RewardFunction]:
         query = f"""
-            SELECT rf.{cst.REWARD_ID}, rf.{cst.REWARD_FUNC}, rf.{cst.FUNC_HASH}, rf.{cst.IS_GENERIC}, rf.{cst.IS_MANUAL}, gtf.{cst.REWARD_WEIGHT}
+            SELECT
+                rf.{cst.REWARD_ID},
+                rf.{cst.REWARD_FUNC},
+                rf.{cst.FUNC_HASH},
+                rf.{cst.IS_GENERIC},
+                rf.{cst.IS_MANUAL},
+                gtf.{cst.REWARD_WEIGHT}
             FROM {cst.REWARD_FUNCTIONS_TABLE} rf
             JOIN {cst.GRPO_TASK_FUNCTIONS_TABLE} gtf ON rf.{cst.REWARD_ID} = gtf.{cst.REWARD_ID}
             WHERE gtf.{cst.TASK_ID} = $1

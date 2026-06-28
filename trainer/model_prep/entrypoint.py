@@ -21,15 +21,15 @@ from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 
-from core import constants as cst
-from core.constants import EnvironmentName
+from core.constants.environments import EnvironmentName
+from core.constants.paths import LORA_ADAPTER_CONFIG_FILE
+from core.downloads import download_s3_file
 from core.models.model_prep_models import AugmentationConfig
 from core.models.model_prep_models import AugmentationScope
 from core.models.model_prep_models import AugmentationType
 from core.models.model_prep_models import EnvBaselineConfig
 from core.models.model_prep_models import ModelPrepResult
-from core.models.utility_models import TaskType
-from core.utils import download_s3_file
+from core.models.task_models import TaskType
 from trainer.model_prep.augmentation import augment_model
 from trainer.model_prep.env_stats import compute_env_stats
 from trainer.model_prep.stats import compute_text_stats
@@ -41,7 +41,7 @@ def detect_and_merge_lora(model_id: str, hf_token: str) -> ModelPrepResult:
     model_id can be a local path or HF repo. Checks for adapter_config.json
     locally first, falls back to HF API for remote repos.
     """
-    adapter_config_path = os.path.join(model_id, cst.LORA_ADAPTER_CONFIG_FILE)
+    adapter_config_path = os.path.join(model_id, LORA_ADAPTER_CONFIG_FILE)
     is_local = os.path.isdir(model_id)
 
     if is_local:
@@ -51,7 +51,7 @@ def detect_and_merge_lora(model_id: str, hf_token: str) -> ModelPrepResult:
         try:
             api = HfApi(token=hf_token)
             repo_files = api.list_repo_files(model_id, token=hf_token)
-            if cst.LORA_ADAPTER_CONFIG_FILE not in repo_files:
+            if LORA_ADAPTER_CONFIG_FILE not in repo_files:
                 return ModelPrepResult(effective_model_path=model_id)
         except Exception as exc:
             print(f"Could not check for LoRA: {exc}, loading as full weights", flush=True)
@@ -64,7 +64,7 @@ def detect_and_merge_lora(model_id: str, hf_token: str) -> ModelPrepResult:
             with open(adapter_config_path) as f:
                 adapter_config = json.load(f)
         else:
-            config_path = hf_hub_download(model_id, cst.LORA_ADAPTER_CONFIG_FILE, token=hf_token)
+            config_path = hf_hub_download(model_id, LORA_ADAPTER_CONFIG_FILE, token=hf_token)
             with open(config_path) as f:
                 adapter_config = json.load(f)
 
@@ -74,13 +74,12 @@ def detect_and_merge_lora(model_id: str, hf_token: str) -> ModelPrepResult:
             return ModelPrepResult(effective_model_path=model_id)
 
         # Walk the LoRA chain and merge all adapters bottom-to-top. The immediate base
-        # may itself be an adapter — loading it directly fails, and merging only the top
-        # adapter onto the foundation drops the intermediates.
+        # may itself be an adapter, so loading it directly can fail or drop deltas.
         chain: list[str] = []
         real_base = base_model_id
         for _ in range(10):
             try:
-                cfg = hf_hub_download(real_base, cst.LORA_ADAPTER_CONFIG_FILE, token=hf_token)
+                cfg = hf_hub_download(real_base, LORA_ADAPTER_CONFIG_FILE, token=hf_token)
                 with open(cfg) as f:
                     parent_base = json.load(f).get("base_model_name_or_path")
             except Exception:
@@ -183,8 +182,8 @@ def generate_anonymous_repo_name(model_id: str, seed: int) -> str:
 def load_training_data(path: str) -> list[dict]:
     """Load all training data records from a JSON file.
 
-    The full record list is needed for an accurate total-token estimate;
-    stats functions subsample internally for anything expensive.
+    Stats functions subsample internally for expensive operations, but need the
+    full record count for total-token estimates.
     """
     if path.startswith("http"):
         local_path = asyncio.run(download_s3_file(path))
@@ -228,14 +227,7 @@ def upload_augmented_model(model, tokenizer, repo_id: str, hf_token: str) -> Non
 
 
 def _load_config_with_yarn_fix(model_path: str, hf_token: str):
-    """Load the model config, working around a transformers crash on YaRN models.
-
-    transformers' `_compute_yarn_parameters` resolves head_dim with a getattr fallback,
-    but some configs (e.g. Mistral) set `head_dim` to None, so the fallback never fires
-    and `None * partial_rotary_factor` raises TypeError. Only the YaRN rope path reads
-    head_dim, so non-YaRN models are unaffected. Set it to the value transformers itself
-    would derive (hidden_size // num_attention_heads).
-    """
+    """Load model config while avoiding a transformers YaRN head_dim=None crash."""
     config = AutoConfig.from_pretrained(model_path, token=hf_token)
     head_dim = config.head_dim if hasattr(config, "head_dim") else None
     if head_dim is None and hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
@@ -262,7 +254,7 @@ def main():
     print(f"[model_prep] Loading model: {model_path} (gpus={n_gpus})", flush=True)
     model_config = _load_config_with_yarn_fix(model_path, hf_token)
     # Load in the model's native dtype ("auto" reads config.torch_dtype) rather than forcing
-    # fp16: bf16-native models (e.g. Qwen3) overflow in fp16, producing NaN baseline stats.
+    # fp16: bf16-native models can overflow in fp16, producing NaN baseline stats.
     if n_gpus > 1:
         print(f"[model_prep] Multi-GPU detected ({n_gpus}), using device_map=auto", flush=True)
         model = AutoModelForCausalLM.from_pretrained(
@@ -312,8 +304,8 @@ def main():
                 for k, v in raw_configs.items()
             }
             stats = asyncio.run(compute_env_stats(
-                # The merged path, not args.model: on round continuation the raw
-                # model can be a bare LoRA adapter dir, which SGLang can't serve.
+                # Use the merged path for LoRA continuation; a bare adapter dir
+                # cannot be served directly by SGLang.
                 model_path=model_path,
                 model=model,
                 env_configs=env_configs,

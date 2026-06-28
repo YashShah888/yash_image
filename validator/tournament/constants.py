@@ -1,4 +1,26 @@
-from core.constants import EnvironmentName
+from datetime import date
+
+from core.constants.environments import EnvironmentName
+
+
+TOURNAMENT_INTERVAL_HOURS = 120
+
+# Tournament scheduling settings
+TOURNAMENT_SCHEDULE_ENVIRONMENT_DAY_OF_WEEK = 0
+TOURNAMENT_SCHEDULE_ENVIRONMENT_HOUR = 11
+TOURNAMENT_SCHEDULE_TEXT_DAY_OF_WEEK = 0
+TOURNAMENT_SCHEDULE_TEXT_HOUR = 13
+TOURNAMENT_SCHEDULE_IMAGE_DAY_OF_WEEK = 0
+TOURNAMENT_SCHEDULE_IMAGE_HOUR = 15
+
+# Tournament start requirements
+MIN_MINERS_FOR_ENV_TOURN = 5
+MIN_MINERS_FOR_TOURN = 4  # within the small-tournament band (3..9): round 1 is a single group, top 2 advance
+
+# Boss round historical task selection
+BOSS_ROUND_HISTORICAL_START_DATE = date(2025, 6, 1)
+BOSS_ROUND_HISTORICAL_END_DATE = date(2025, 8, 1)
+MIN_SUCCESSFUL_SCORES_FOR_HISTORICAL_TASK = 2
 
 MAX_TRAINING_ATTEMPTS = 2
 
@@ -61,9 +83,8 @@ SMALL_TOURNAMENT_MAX_PARTICIPANTS = 14  # i.e. fewer than 15 at tournament start
 SMALL_TOURNAMENT_GROUP_TASKS = 3
 SMALL_TOURNAMENT_ADVANCE = 2
 MIN_ENVIRONMENT_GROUP_SIZE = 2
-# Round-1 group tasks evaluate every pair of miners head-to-head (PvP), so eval cost scales
-# with C(n,2). The champion (boss) is injected into the smallest group on top of its miners,
-# so the cap is enforced *including* the boss: <= 4 members => <= C(4,2) = 6 PvP pairs/group.
+# Cap includes the injected boss. With 4 members, a group evaluates at most
+# C(4, 2) = 6 PvP pairs.
 MAX_ENVIRONMENT_GROUP_SIZE = 4
 # Small env tournaments collapse too fast (one big group advancing 1 contender). When the
 # field is smaller than SMALL_ENVIRONMENT_MAX_PARTICIPANTS, cap the group size lower so there
@@ -84,6 +105,22 @@ ENV_TARGET_TOURN_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 FORCED_BOSS_ENVIRONMENT: EnvironmentName | None = None
 
 TOURNAMENT_PARTICIPANT_PING_BATCH_SIZE = 50
+DEFAULT_PARTICIPANT_REPO = "https://github.com/rayonlabs/G.O.D"
+DEFAULT_PARTICIPANT_COMMIT = "8631451156e2915070f77e5547ca0d5ed3d0eb8a"
+
+LATEST_TOURNAMENTS_CACHE_TTL = 3600
+LATEST_TOURNAMENTS_CACHE_KEY = "latest_tournaments_details"
+
+CLAUDE_REPO_DIFF_MODEL = "claude-sonnet-4-5"
+CLAUDE_REPO_DIFF_MAX_TURNS = 30
+CLAUDE_REPO_DIFF_MAX_BUDGET_USD = 2
+CLAUDE_REPO_DIFF_MAX_FOCUS_FILES = 180
+
+TOURN_DEDUP_ENABLED = True
+TOURN_DEDUP_CLAUDE_MODEL = "claude-opus-4-8"
+TOURN_DEDUP_CLAUDE_MAX_TURNS = 60
+TOURN_DEDUP_CLAUDE_MAX_BUDGET_USD = 15
+TOURN_DEDUP_CONCURRENCY = 8
 
 R1_TEXT_DATASET_BIN = (20_000, 75_000)
 
@@ -112,16 +149,15 @@ MODEL_SIZE_RANGE_MULTIPLIER_MAX = 1.2
 MODEL_PARAMS_TO_BILLIONS = 1e9
 
 # Progressive championship threshold constants.
-# Thresholds are disabled: dethroning is decided purely by head-to-head task wins
-# (text/image: lose at most one of the boss-round tasks; environment: zero losses).
-# Kept at 0.0 so all per-task boss comparisons are straight score comparisons.
-EXPONENTIAL_BASE_THRESHOLD = 0.0  # No boss edge — strict score comparison
+# Thresholds are disabled: dethroning is decided by head-to-head task wins
+# (text/image: lose at most one boss-round task; environment: zero losses).
+EXPONENTIAL_BASE_THRESHOLD = 0.0
 EXPONENTIAL_BASE_THRESHOLD_ENVIRONMENT = EXPONENTIAL_BASE_THRESHOLD
-EXPONENTIAL_DECAY_RATE = 0.8  # Unused while thresholds are disabled
-EXPONENTIAL_MIN_THRESHOLD = 0.0  # No threshold floor
+EXPONENTIAL_DECAY_RATE = 0.8
+EXPONENTIAL_MIN_THRESHOLD = 0.0
 
 # Obfuscation detection constants
-OBFUSCATION_DETECTION_PATH = "./validator/obfuscation_detection/anti_obfuscation"
+OBFUSCATION_DETECTION_PATH = "./validator/tournament/obfuscation_detection/anti_obfuscation"
 
 # Round Sanity Check
 PERCENTAGE_OF_TASKS_SHOULD_BE_SUCCESS = 0.5

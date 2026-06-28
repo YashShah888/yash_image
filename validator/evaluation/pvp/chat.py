@@ -1,4 +1,4 @@
-"""Back-compat shim: PvP chat client moved to core.pvp.chat (shared with model-prep)."""
+"""Back-compat shim: PvP chat client moved to core.pvp.chat."""
 
 from core.pvp.chat import chat_completion
 from core.pvp.chat import create_client

@@ -5,30 +5,30 @@ from fastapi import Depends
 from fastapi import HTTPException
 from loguru import logger  # noqa
 
-from core.models.utility_models import ImageTextPair
-from core.models.utility_models import RewardFunction
-from core.models.utility_models import TaskType
-from validator.core.config import Config
-from validator.core.dependencies import get_config
-from validator.core.models import AnyTypeTask
-from validator.core.models import AnyTypeTaskWithHotkeyDetails
-from validator.core.models import ChatTask
-from validator.core.models import ChatTaskWithHotkeyDetails
-from validator.core.models import DpoTask
-from validator.core.models import EnvTask
-from validator.core.models import EnvTaskWithHotkeyDetails
-from validator.core.models import DpoTaskWithHotkeyDetails
-from validator.core.models import GrpoTask
-from validator.core.models import GrpoTaskWithHotkeyDetails
-from validator.core.models import HotkeyDetails
-from validator.core.models import ImageTask
-from validator.core.models import ImageTaskWithHotkeyDetails
-from validator.core.models import InstructTextTask
-from validator.core.models import InstructTextTaskWithHotkeyDetails
+from core.models.dataset_models import ImageTextPair
+from core.models.reward_models import RewardFunction
+from core.models.task_models import TaskType
+from validator.app.config import Config
+from validator.app.dependencies import get_config
 from validator.db import constants as cst
 from validator.db.sql import tasks as tasks_sql
-from validator.utils.util import hide_sensitive_data_till_finished
-from validator.utils.util import normalise_float
+from validator.tasks.details import hide_sensitive_data_till_finished
+from validator.tasks.details import normalise_float
+from validator.tasks.models import AnyTypeTask
+from validator.tasks.models import AnyTypeTaskWithHotkeyDetails
+from validator.tasks.models import ChatTask
+from validator.tasks.models import ChatTaskWithHotkeyDetails
+from validator.tasks.models import DpoTask
+from validator.tasks.models import DpoTaskWithHotkeyDetails
+from validator.tasks.models import EnvTask
+from validator.tasks.models import EnvTaskWithHotkeyDetails
+from validator.tasks.models import GrpoTask
+from validator.tasks.models import GrpoTaskWithHotkeyDetails
+from validator.tasks.models import HotkeyDetails
+from validator.tasks.models import ImageTask
+from validator.tasks.models import ImageTaskWithHotkeyDetails
+from validator.tasks.models import InstructTextTask
+from validator.tasks.models import InstructTextTaskWithHotkeyDetails
 
 
 async def get_recent_tasks(
@@ -115,6 +115,7 @@ async def get_recent_tasks(
             itt.no_input_format,
             itt.file_format as itt_file_format,
             it.model_type,
+            it.trigger_word,
             ip.image_text_pairs,
             dt.field_prompt as dpo_field_prompt,
             dt.field_chosen,

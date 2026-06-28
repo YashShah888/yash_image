@@ -19,6 +19,7 @@ from core.models.pvp_models import ToolCall
 from core.models.pvp_models import ToolSchema
 from core.pvp import constants as cst
 
+
 logger = logging.getLogger(__name__)
 
 _THINK_COMPLETE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)

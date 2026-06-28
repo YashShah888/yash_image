@@ -32,11 +32,11 @@ from core.models.pvp_models import MemoryArea
 from core.models.pvp_models import MemoryConfig
 from core.models.pvp_models import ToolCall
 from core.models.pvp_models import ToolSchema
+from core.pvp import constants as cst
 from core.pvp import tools as tool_lib
+from core.pvp.agents import BaseGameAgent
 from core.pvp.memory import SlotMemory
 from core.pvp.memory import WhitespaceTokenCounter
-from core.pvp import constants as cst
-from core.pvp.agents import BaseGameAgent
 
 
 logger = logging.getLogger(__name__)

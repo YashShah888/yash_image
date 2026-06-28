@@ -1,4 +1,4 @@
-"""Back-compat shim: the PvP bot moved to core.pvp.bot (shared with model-prep)."""
+"""Back-compat shim: the PvP bot moved to core.pvp.bot."""
 
 from core.pvp.bot import ContextOverflowError
 from core.pvp.bot import EmptyLegalActionsError

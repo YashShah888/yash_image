@@ -6,10 +6,10 @@ import aiohttp
 from git import Repo
 from git.exc import GitCommandError
 
-from core.utils import build_authenticated_git_url
-from core.utils import sanitize_git_text
-from validator.core.config import Config
-from validator.utils.logging import get_logger
+from core.git import build_authenticated_git_url
+from core.git import sanitize_git_text
+from core.logging import get_logger
+from validator.app.config import Config
 
 
 logger = get_logger(__name__)

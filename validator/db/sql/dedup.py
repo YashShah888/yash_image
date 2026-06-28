@@ -6,13 +6,13 @@ from datetime import timezone
 from typing import Any
 
 import validator.db.constants as cst
-from core.models.tournament_models import DedupClusterRecord
-from core.models.tournament_models import DedupPairVerdict
-from core.models.tournament_models import DedupReviewStatus
-from core.models.tournament_models import PublishedRepo
-from core.models.tournament_models import TournamentDedupReview
+from core.logging import get_logger
 from validator.db.database import PSQLDB
-from validator.utils.logging import get_logger
+from validator.tournament.models import DedupClusterRecord
+from validator.tournament.models import DedupPairVerdict
+from validator.tournament.models import DedupReviewStatus
+from validator.tournament.models import PublishedRepo
+from validator.tournament.models import TournamentDedupReview
 
 
 logger = get_logger(__name__)

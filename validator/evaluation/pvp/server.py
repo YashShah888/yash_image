@@ -10,11 +10,12 @@ import os
 import subprocess
 import threading
 
+import validator.evaluation.constants as vcst
 from core.models.pvp_models import PreparedModel
 from core.pvp.sglang_launch import build_base_command
 from core.pvp.sglang_parsers import tool_call_parser_for
-from validator.core import constants as vcst
-from validator.evaluation.eval_environment import _wait_for_health
+from validator.evaluation.evaluators.environment import _wait_for_health
+
 
 logger = logging.getLogger(__name__)
 

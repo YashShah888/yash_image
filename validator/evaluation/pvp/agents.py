@@ -1,4 +1,4 @@
-"""Back-compat shim: PvP agents moved to core.pvp.agents (shared with model-prep)."""
+"""Back-compat shim: PvP agents moved to core.pvp.agents."""
 
 from core.pvp.agents import BaseGameAgent
 from core.pvp.agents import ClobberAgent

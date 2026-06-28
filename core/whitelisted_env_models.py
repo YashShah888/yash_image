@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+
 _WHITELIST_PATH = Path(__file__).parent / "whitelisted_env_models.json"
 
 # Base models miners may train for the environment tournament. Ordered list

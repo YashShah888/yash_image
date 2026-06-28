@@ -11,31 +11,15 @@ from fiber.chain.models import Node
 from huggingface_hub import hf_hub_download
 from huggingface_hub import repo_exists
 
-from core.constants import HUGGINGFACE_TOKEN
-from core.constants import RAYONLABS_HF_USERNAME
-from core.constants import TrainingStartPoint
-import validator.core.constants as cst
+from core.constants.credentials import HUGGINGFACE_TOKEN
+from core.constants.credentials import RAYONLABS_HF_USERNAME
+from core.constants.environments import TrainingStartPoint
+from core.datasets.whitelist import validate_requested_datasets
+from core.logging import LogContext
+from core.logging import get_logger
 from core.models.payload_models import TrainingRepoResponse
-from core.models.tournament_models import Group
-from core.models.tournament_models import GroupRound
-from core.models.tournament_models import KnockoutRound
-from core.models.tournament_models import RespondingNode
-from core.models.tournament_models import Round
-from core.models.tournament_models import RoundStatus
-from core.models.tournament_models import RoundType
-from core.models.tournament_models import TournamentData
-from core.models.tournament_models import TournamentParticipant
-from core.models.tournament_models import TournamentRoundData
-from core.models.tournament_models import TournamentStatus
-from core.models.tournament_models import TournamentTask
-from core.models.tournament_models import TournamentType
-from core.models.tournament_models import generate_round_id
-from core.models.tournament_models import generate_tournament_id
-from core.models.utility_models import TaskStatus
-from core.whitelisted_sft_datasets import validate_requested_datasets
-from validator.core.config import Config
-from validator.core.constants import EMISSION_BURN_HOTKEY
-from validator.core.models import AnyTypeTask
+from core.models.task_models import TaskStatus
+from validator.app.config import Config
 from validator.db.database import PSQLDB
 from validator.db.sql import tasks as task_sql
 from validator.db.sql.nodes import get_all_nodes
@@ -67,33 +51,49 @@ from validator.db.sql.tournaments import update_tournament_winner_hotkey
 from validator.db.sql.tournaments import update_tournament_winner_model
 from validator.db.sql.transfers import deduct_tournament_participation_fee
 from validator.db.sql.transfers import get_coldkey_balance_by_address
+from validator.infrastructure.content_service import process_non_stream_fiber_get
+from validator.infrastructure.service_constants import TRAINING_REPO_ENDPOINT
+from validator.scoring.constants import EMISSION_BURN_HOTKEY
+from validator.tasks.models import AnyTypeTask
 from validator.tournament import constants as t_cst
 from validator.tournament.benchmark_utils import create_benchmark_tasks_for_tournament_winner
 from validator.tournament.dedup_gate import apply_r1_eliminations
 from validator.tournament.dedup_gate import detect_r1_hash_duplicates
 from validator.tournament.dedup_gate import evaluate_r2_dedup_gate
+from validator.tournament.github_validation import deduplicate_by_github_account
+from validator.tournament.github_validation import deduplicate_by_ip_address
+from validator.tournament.github_validation import validate_github_tokens
+from validator.tournament.github_validation import validate_repo_license
+from validator.tournament.github_validation import validate_repo_obfuscation
+from validator.tournament.models import Group
+from validator.tournament.models import GroupRound
+from validator.tournament.models import KnockoutRound
+from validator.tournament.models import RespondingNode
+from validator.tournament.models import Round
+from validator.tournament.models import RoundStatus
+from validator.tournament.models import RoundType
+from validator.tournament.models import TournamentData
+from validator.tournament.models import TournamentParticipant
+from validator.tournament.models import TournamentRoundData
+from validator.tournament.models import TournamentStatus
+from validator.tournament.models import TournamentTask
+from validator.tournament.models import TournamentType
+from validator.tournament.models import generate_round_id
+from validator.tournament.models import generate_tournament_id
+from validator.tournament.notifications import notify_tournament_completed
+from validator.tournament.notifications import notify_tournament_started
+from validator.tournament.notifications import send_to_discord
+from validator.tournament.participants import get_base_contestant
+from validator.tournament.participants import get_challenger_participant_for_retained_boss
+from validator.tournament.participants import get_latest_tournament_winner_participant
 from validator.tournament.repo_uploader import upload_tournament_participant_repository
+from validator.tournament.reports import generate_diff_report_and_notify_tournament_completed
+from validator.tournament.round_results import determine_env_tournament_winner
+from validator.tournament.round_results import get_round_winners
 from validator.tournament.task_creator import create_environment_tournament_tasks
 from validator.tournament.task_creator import create_image_tournament_tasks
 from validator.tournament.task_creator import create_text_tournament_tasks
 from validator.tournament.task_creator import replace_tournament_task
-from validator.tournament.utils import determine_env_tournament_winner
-from validator.tournament.utils import generate_diff_report_and_notify_tournament_completed
-from validator.tournament.utils import get_base_contestant
-from validator.tournament.utils import get_challenger_participant_for_retained_boss
-from validator.tournament.utils import get_latest_tournament_winner_participant
-from validator.tournament.utils import get_round_winners
-from validator.tournament.utils import notify_tournament_completed
-from validator.tournament.utils import notify_tournament_started
-from validator.tournament.utils import send_to_discord
-from validator.tournament.utils import deduplicate_by_github_account
-from validator.tournament.utils import deduplicate_by_ip_address
-from validator.tournament.utils import validate_github_tokens
-from validator.tournament.utils import validate_repo_license
-from validator.tournament.utils import validate_repo_obfuscation
-from validator.utils.call_endpoint import process_non_stream_fiber_get
-from validator.utils.logging import LogContext
-from validator.utils.logging import get_logger
 
 
 logger = get_logger(__name__)
@@ -134,8 +134,6 @@ def organise_tournament_round(
             if round_number == 1 and len(nodes_copy) <= t_cst.SMALL_ENVIRONMENT_MAX_PARTICIPANTS
             else t_cst.MAX_ENVIRONMENT_GROUP_SIZE
         )
-        # Reserve a slot for the boss injected into the smallest group (see assign_nodes_to_tournament_tasks)
-        # so that group still respects max_group_size, i.e. <= C(max,2) PvP pairs.
         boss_will_be_injected = not is_final_round and EMISSION_BURN_HOTKEY not in {n.hotkey for n in nodes_copy}
         effective_count = len(nodes_copy) + (1 if boss_will_be_injected else 0)
         num_groups = math.ceil(effective_count / max_group_size)
@@ -171,10 +169,10 @@ def organise_tournament_round(
         hotkeys = [node.hotkey for node in nodes_copy]
 
         if len(hotkeys) % 2 == 1:
-            if cst.EMISSION_BURN_HOTKEY not in hotkeys:
-                hotkeys.append(cst.EMISSION_BURN_HOTKEY)
+            if EMISSION_BURN_HOTKEY not in hotkeys:
+                hotkeys.append(EMISSION_BURN_HOTKEY)
             else:
-                hotkeys.remove(cst.EMISSION_BURN_HOTKEY)
+                hotkeys.remove(EMISSION_BURN_HOTKEY)
 
         random.shuffle(hotkeys)
         pairs = []
@@ -210,9 +208,7 @@ async def _create_first_round(
 ):
     round_id = generate_round_id(tournament_id, 1)
     with LogContext(round_id=round_id):
-        round_structure = organise_tournament_round(
-            nodes, config, tournament_type, round_id=round_id, round_number=1, is_final_round=False
-        )
+        round_structure = organise_tournament_round(nodes, config, tournament_type, round_id=round_id, round_number=1)
 
         round_type = RoundType.KNOCKOUT if isinstance(round_structure, KnockoutRound) else RoundType.GROUP
 
@@ -253,12 +249,7 @@ async def _create_tournament_tasks(
 
 
 async def _hf_repo_exists(repo_id: str) -> bool:
-    """Whether an HF model repo exists.
-
-    A continuation model can be missing if the miner's previous round failed to
-    upload (e.g. its training errored). On a lookup error we assume it exists, so
-    we only fall back to the base model on a definitive 'not found'.
-    """
+    """Whether an HF model repo exists."""
     try:
         return await asyncio.to_thread(repo_exists, repo_id, repo_type="model", token=HUGGINGFACE_TOKEN)
     except Exception as e:
@@ -285,23 +276,17 @@ async def _get_previous_round_repo(tournament_id: str, hotkey: str, psql_db: PSQ
 
 
 async def _resolve_winner_base_model(winner_repo: str, fallback_model_id: str | None) -> str | None:
-    """The winner model's real foundation base model.
-
-    With the trainer's merge-on-download + base-repoint-on-upload, a winner adapter's
-    base_model_name_or_path already points at the real foundation (no adapter-on-adapter
-    chains), so a single read is enough. Full merged-model winners have no adapter_config,
-    so fall back to the task's declared base model.
-    """
+    """Return the winner model's real foundation base model."""
     try:
         cfg_path = await asyncio.to_thread(
-            hf_hub_download, winner_repo, "adapter_config.json", token=HUGGINGFACE_TOKEN
+            hf_hub_download, winner_repo, "adapter_config.json", token=HUGGINGFACE_TOKEN,
         )
         with open(cfg_path) as f:
             base = json.load(f).get("base_model_name_or_path")
         if base:
             return base
     except Exception:
-        pass  # not an adapter (full merged model) — use the task's declared base
+        pass
     return fallback_model_id
 
 
@@ -329,11 +314,6 @@ async def _save_winner_model_repo(
         winner_repo = f"{RAYONLABS_HF_USERNAME}/{repo_name}"
 
         if task_obj.training_start_point == TrainingStartPoint.PREVIOUS_WINNER:
-            # Record the winner's *actual* foundation base, not the target constant.
-            # Hardcoding ENV_TARGET_TOURN_MODEL here made next tournament's
-            # continue-vs-from-scratch check (winner_model_base == ENV_TARGET_TOURN_MODEL)
-            # always pass, so the boss kept continuing a stale-base lineage and never
-            # reset to the target when the constant changed.
             base = await _resolve_winner_base_model(winner_repo, task_obj.model_id) or t_cst.ENV_TARGET_TOURN_MODEL
             logger.info(f"Saving PREVIOUS_WINNER lineage: {winner_repo} (resolved base={base})")
             await update_tournament_winner_model(tournament_id, winner_repo, base, psql_db)
@@ -350,8 +330,8 @@ async def _save_winner_model_repo(
 
 
 def select_boss_group_index(groups: list[Group]) -> int:
-    """Index of the smallest group — the boss injection target (minimises added PvP pairs, keeps the cap)."""
-    return min(range(len(groups)), key=lambda i: len(groups[i].member_ids))
+    """Return the index of the smallest group for boss injection."""
+    return min(range(len(groups)), key=lambda index: len(groups[index].member_ids))
 
 
 async def assign_nodes_to_tournament_tasks(
@@ -365,11 +345,9 @@ async def assign_nodes_to_tournament_tasks(
     if isinstance(round_structure, GroupRound):
         all_round_tasks = await get_tournament_tasks(round_structure.round_id, psql_db)
 
-        # The boss may already be a competing member of a group this round; only inject it
-        # (into the smallest group) when it isn't, so it never gets assigned to two tasks.
         boss_target_idx = (
             None
-            if not is_environment_tournament or any(EMISSION_BURN_HOTKEY in g.member_ids for g in round_structure.groups)
+            if not is_environment_tournament or any(EMISSION_BURN_HOTKEY in group.member_ids for group in round_structure.groups)
             else select_boss_group_index(round_structure.groups)
         )
         for i, group in enumerate(round_structure.groups):
@@ -409,9 +387,6 @@ async def assign_nodes_to_tournament_tasks(
 
                         if task_obj and task_obj.training_start_point == TrainingStartPoint.CONTINUATION:
                             prev_repo = await _get_previous_round_repo(tournament_id, hotkey, psql_db)
-                            # The continuation model may not exist (e.g. the miner's previous
-                            # round failed to upload). Fall back to the base model so prep and
-                            # training still run instead of blocking on a 404 forever.
                             if prev_repo and not await _hf_repo_exists(prev_repo):
                                 logger.warning(
                                     f"Continuation model {prev_repo} for {hotkey[:8]} not found on HF; "
@@ -495,22 +470,22 @@ async def create_next_round(
 
         if is_env:
             # Env tournaments use groups — boss stays, final when only boss + 1 challenger
-            if len(winners) == 2 and cst.EMISSION_BURN_HOTKEY in winners:
+            if len(winners) == 2 and EMISSION_BURN_HOTKEY in winners:
                 next_round_is_final = True
         else:
             # Text/image knockout tournaments need even pairs
             if len(winners) == 2:
-                if cst.EMISSION_BURN_HOTKEY in winners:
+                if EMISSION_BURN_HOTKEY in winners:
                     next_round_is_final = True
             elif len(winners) % 2 == 1:
-                if cst.EMISSION_BURN_HOTKEY not in winners:
-                    winners.append(cst.EMISSION_BURN_HOTKEY)
+                if EMISSION_BURN_HOTKEY not in winners:
+                    winners.append(EMISSION_BURN_HOTKEY)
                     logger.info("Added burn hotkey to make even number of participants")
                 else:
                     if len(winners) == 1:
                         next_round_is_final = True
                     else:
-                        winners = [w for w in winners if w != cst.EMISSION_BURN_HOTKEY]
+                        winners = [w for w in winners if w != EMISSION_BURN_HOTKEY]
                         logger.info("Removed burn hotkey to make even number of participants")
 
         winner_nodes = []
@@ -580,9 +555,9 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
         # For environment tournaments, boss auto-advances through non-final rounds
         # only when there are winners. Empty winners use generic boss fallback below.
         if tournament.tournament_type == TournamentType.ENVIRONMENT and not completed_round.is_final_round:
-            if winners and cst.EMISSION_BURN_HOTKEY not in winners:
-                winners.append(cst.EMISSION_BURN_HOTKEY)
-                logger.info(f"Boss {cst.EMISSION_BURN_HOTKEY} auto-advances to next environment round")
+            if winners and EMISSION_BURN_HOTKEY not in winners:
+                winners.append(EMISSION_BURN_HOTKEY)
+                logger.info(f"Boss {EMISSION_BURN_HOTKEY} auto-advances to next environment round")
 
         # Get all active participants and handle eliminations
         all_participants = await get_tournament_participants(tournament.tournament_id, psql_db)
@@ -593,7 +568,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
         losers = [
             p
             for p in active_participants
-            if p not in winners and not (p == cst.EMISSION_BURN_HOTKEY and not completed_round.is_final_round)
+            if p not in winners and not (p == EMISSION_BURN_HOTKEY and not completed_round.is_final_round)
         ]
         logger.info(f"Losers to be eliminated: {len(losers)} - {losers}")
 
@@ -608,7 +583,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
                 f"No winners found for round {completed_round.round_id}. Setting base contestant as winner of the tournament."
             )
             # Keep EMISSION_BURN_HOTKEY as the winner when defending champion wins by default
-            winner = cst.EMISSION_BURN_HOTKEY
+            winner = EMISSION_BURN_HOTKEY
             await update_tournament_winner_hotkey(tournament.tournament_id, winner, psql_db)
             # await update_tournament_status(tournament.tournament_id, TournamentStatus.COMPLETED, psql_db)
             logger.info(f"Tournament {tournament.tournament_id} completed with winner: {winner}. Please update DB manually.")
@@ -640,7 +615,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
             # The base_winner_hotkey field already tracks the actual identity for display purposes
             logger.info(f"Processing final round completion for tournament {tournament.tournament_id}")
             logger.info(f"Final round winner: {winner}")
-            if winner == cst.EMISSION_BURN_HOTKEY and tournament.base_winner_hotkey:
+            if winner == EMISSION_BURN_HOTKEY and tournament.base_winner_hotkey:
                 logger.info(
                     f"Defending champion {tournament.base_winner_hotkey} successfully defended (stored as EMISSION_BURN_HOTKEY)"
                 )
@@ -658,10 +633,10 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
 
             # Save winner's model repo for next tournament's PREVIOUS_WINNER task
             if tournament.tournament_type == TournamentType.ENVIRONMENT:
-                save_hotkey = winner if winner != cst.EMISSION_BURN_HOTKEY else cst.EMISSION_BURN_HOTKEY
+                save_hotkey = winner if winner != EMISSION_BURN_HOTKEY else EMISSION_BURN_HOTKEY
                 await _save_winner_model_repo(tournament.tournament_id, save_hotkey, round_tasks, psql_db)
 
-            if winner != cst.EMISSION_BURN_HOTKEY:
+            if winner != EMISSION_BURN_HOTKEY:
                 try:
                     logger.info(f"Creating benchmark tasks for tournament winner {winner}")
                     benchmark_task_ids = await create_benchmark_tasks_for_tournament_winner(
@@ -679,7 +654,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
             challenger_repo = position_1_repo
             challenger_commit_hash = None
             challenger_github_token = None
-            if winner == cst.EMISSION_BURN_HOTKEY:
+            if winner == EMISSION_BURN_HOTKEY:
                 challenger = await get_challenger_participant_for_retained_boss(
                     tournament, completed_round, winners, psql_db
                 )
@@ -706,7 +681,7 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
         else:
             # R2 gate: before building round 2, check the entrants for functional duplicates.
             # On flags this HALTS advancement (returns) until a human approves in the DB.
-            if cst.TOURN_DEDUP_ENABLED and completed_round.round_number == 1:
+            if t_cst.TOURN_DEDUP_ENABLED and completed_round.round_number == 1:
                 decision = await evaluate_r2_dedup_gate(tournament, completed_round, winners, config, psql_db)
                 if decision.halt:
                     logger.info(f"Dedup gate holding tournament {tournament.tournament_id} at R2 pending manual review")
@@ -755,7 +730,7 @@ async def create_basic_tournament(tournament_type: TournamentType, psql_db: PSQL
 
 async def populate_tournament_participants(tournament_id: str, config: Config, psql_db: PSQLDB) -> int:
     logger.info(
-        f"Populating participants for tournament {tournament_id} with minimum requirement of {cst.MIN_MINERS_FOR_TOURN} miners"
+        f"Populating participants for tournament {tournament_id} with minimum requirement of {t_cst.MIN_MINERS_FOR_TOURN} miners"
     )
 
     tournament = await get_tournament(tournament_id, psql_db)
@@ -781,7 +756,7 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
         all_nodes = await get_all_nodes(psql_db)
 
         # Get all nodes except base contestant
-        eligible_nodes = [node for node in all_nodes if node.hotkey != cst.EMISSION_BURN_HOTKEY]
+        eligible_nodes = [node for node in all_nodes if node.hotkey != EMISSION_BURN_HOTKEY]
 
         if not eligible_nodes:
             logger.warning("No eligible nodes found for tournament")
@@ -933,9 +908,9 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
         logger.info(f"Successfully populated {miners_that_accept_and_give_repos} participants for tournament {tournament_id}")
 
         if tournament.tournament_type == TournamentType.ENVIRONMENT:
-            min_required_miners = cst.MIN_MINERS_FOR_ENV_TOURN
+            min_required_miners = t_cst.MIN_MINERS_FOR_ENV_TOURN
         else:
-            min_required_miners = cst.MIN_MINERS_FOR_TOURN
+            min_required_miners = t_cst.MIN_MINERS_FOR_TOURN
 
         if miners_that_accept_and_give_repos >= min_required_miners:
             logger.info(
@@ -954,7 +929,7 @@ async def populate_tournament_participants(tournament_id: str, config: Config, p
 async def _get_miner_training_repo(node: Node, config: Config, tournament_type: TournamentType) -> TrainingRepoResponse | None:
     """Get training repo from a miner, similar to how submissions are fetched in the main validator cycle."""
     try:
-        url = f"{cst.TRAINING_REPO_ENDPOINT}/{tournament_type.value}"
+        url = f"{TRAINING_REPO_ENDPOINT}/{tournament_type.value}"
         response = await process_non_stream_fiber_get(url, config, node)
 
         if response and isinstance(response, dict):
@@ -988,7 +963,7 @@ async def create_first_round_for_active_tournament(tournament_id: str, config: C
 
     participant_nodes = []
     for participant in participants:
-        if participant.hotkey == cst.EMISSION_BURN_HOTKEY:
+        if participant.hotkey == EMISSION_BURN_HOTKEY:
             continue
 
         node = await get_node_by_hotkey(participant.hotkey, psql_db)
@@ -1002,7 +977,7 @@ async def create_first_round_for_active_tournament(tournament_id: str, config: C
     # R1 pre-training de-dup: detect exact/normalized hash duplicates and exclude them from the
     # bracket (they've already paid the entry fee — they forfeit it and don't get to train).
     dedup_result = None
-    if cst.TOURN_DEDUP_ENABLED:
+    if t_cst.TOURN_DEDUP_ENABLED:
         dedup_result = await detect_r1_hash_duplicates(tournament, [n.hotkey for n in participant_nodes], psql_db)
         flagged = set(dedup_result.flagged_hotkeys)
         if flagged:
@@ -1456,11 +1431,11 @@ def _get_tournament_schedule(tournament_type: TournamentType) -> tuple[int, int]
     Returns (day_of_week, hour) where day_of_week is 0=Monday through 6=Sunday.
     """
     if tournament_type == TournamentType.ENVIRONMENT:
-        return (cst.TOURNAMENT_SCHEDULE_ENVIRONMENT_DAY_OF_WEEK, cst.TOURNAMENT_SCHEDULE_ENVIRONMENT_HOUR)
+        return (t_cst.TOURNAMENT_SCHEDULE_ENVIRONMENT_DAY_OF_WEEK, t_cst.TOURNAMENT_SCHEDULE_ENVIRONMENT_HOUR)
     elif tournament_type == TournamentType.TEXT:
-        return (cst.TOURNAMENT_SCHEDULE_TEXT_DAY_OF_WEEK, cst.TOURNAMENT_SCHEDULE_TEXT_HOUR)
+        return (t_cst.TOURNAMENT_SCHEDULE_TEXT_DAY_OF_WEEK, t_cst.TOURNAMENT_SCHEDULE_TEXT_HOUR)
     elif tournament_type == TournamentType.IMAGE:
-        return (cst.TOURNAMENT_SCHEDULE_IMAGE_DAY_OF_WEEK, cst.TOURNAMENT_SCHEDULE_IMAGE_HOUR)
+        return (t_cst.TOURNAMENT_SCHEDULE_IMAGE_DAY_OF_WEEK, t_cst.TOURNAMENT_SCHEDULE_IMAGE_HOUR)
     else:
         # Default fallback
         return (0, 14)

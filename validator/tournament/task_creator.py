@@ -1,38 +1,38 @@
 import random
 
-from core.constants import EnvironmentName
-from core.constants import TrainingStartPoint
-from core.models.tournament_models import GroupRound
-from core.models.tournament_models import TournamentType
-from core.models.tournament_models import KnockoutRound
-from core.models.tournament_models import Round
-from core.models.tournament_models import TournamentTask
-from core.models.utility_models import ImageModelType
-from core.models.utility_models import TaskType
-from validator.core.config import Config
-from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_DPO
-from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_GRPO
-from validator.core.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_INSTRUCT_TEXT
-from validator.core.models import EnvRawTask
-from validator.core.models import InstructTextRawTask
-from validator.core.models import RawTask
+from core.constants.environments import EnvironmentName
+from core.constants.environments import TrainingStartPoint
+from core.logging import get_logger
+from core.models.image_models import ImageModelType
+from core.models.task_models import TaskType
+from validator.app.config import Config
 from validator.db.sql import tasks as task_sql
 from validator.db.sql.tournaments import add_tournament_tasks
 from validator.db.sql.tournaments import get_latest_completed_tournament
 from validator.db.sql.tournaments import get_tournament_rounds
 from validator.db.sql.tournaments import get_tournament_tasks
-from validator.tasks.diffusion_synth import create_synthetic_image_task
-from validator.tasks.synthetic_scheduler import _get_dpo_datasets
-from validator.tasks.synthetic_scheduler import _get_image_models
-from validator.tasks.synthetic_scheduler import _get_instruct_text_datasets
-from validator.tasks.synthetic_scheduler import _get_text_models
-from validator.tasks.synthetic_scheduler import create_synthetic_dpo_task
-from validator.tasks.synthetic_scheduler import create_synthetic_env_task
-from validator.tasks.synthetic_scheduler import create_synthetic_grpo_task
-from validator.tasks.synthetic_scheduler import create_synthetic_instruct_text_task
+from validator.tasks.models import EnvRawTask
+from validator.tasks.models import InstructTextRawTask
+from validator.tasks.models import RawTask
+from validator.tasks.synthetics.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_DPO
+from validator.tasks.synthetics.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_GRPO
+from validator.tasks.synthetics.constants import PERCENTAGE_OF_TASKS_THAT_SHOULD_BE_INSTRUCT_TEXT
+from validator.tasks.synthetics.diffusion import create_synthetic_image_task
+from validator.tasks.synthetics.scheduler import _get_dpo_datasets
+from validator.tasks.synthetics.scheduler import _get_image_models
+from validator.tasks.synthetics.scheduler import _get_instruct_text_datasets
+from validator.tasks.synthetics.scheduler import _get_text_models
+from validator.tasks.synthetics.scheduler import create_synthetic_dpo_task
+from validator.tasks.synthetics.scheduler import create_synthetic_env_task
+from validator.tasks.synthetics.scheduler import create_synthetic_grpo_task
+from validator.tasks.synthetics.scheduler import create_synthetic_instruct_text_task
 from validator.tournament import constants as t_cst
-from validator.tournament.gpu import get_tournament_gpu_requirement
-from validator.utils.logging import get_logger
+from validator.tournament.gpu_requirements import get_tournament_gpu_requirement
+from validator.tournament.models import GroupRound
+from validator.tournament.models import KnockoutRound
+from validator.tournament.models import Round
+from validator.tournament.models import TournamentTask
+from validator.tournament.models import TournamentType
 
 
 logger = get_logger(__name__)
@@ -122,16 +122,12 @@ async def _get_tournament_base_model(tournament_id: str, config: Config) -> str 
 
 
 async def _get_prev_tournament_env_names(tournament_id: str, config: Config) -> set[EnvironmentName]:
-    """Environments used in ANY round of the immediately previous completed env tournament.
-
-    Used to bias R1 env selection toward games not seen last tournament. Empty set when there
-    is no previous tournament (then R1 falls back to fully random selection).
-    """
     prev = await get_latest_completed_tournament(
         config.psql_db, TournamentType.ENVIRONMENT, exclude_tournament_id=tournament_id,
     )
     if not prev:
         return set()
+
     seen: set[EnvironmentName] = set()
     for prev_round in await get_tournament_rounds(prev.tournament_id, config.psql_db):
         for tourn_task in await get_tournament_tasks(prev_round.round_id, config.psql_db):
@@ -142,16 +138,12 @@ async def _get_prev_tournament_env_names(tournament_id: str, config: Config) -> 
 
 
 def _select_r1_env_names(
-    num_envs: int, seen_last_tournament: set[EnvironmentName]
+    num_envs: int,
+    seen_last_tournament: set[EnvironmentName],
 ) -> list[EnvironmentName]:
-    """Pick num_envs environments for R1, preferring games not seen in the last tournament.
-
-    Unseen games are exhausted first (in random order); the remainder is filled randomly from
-    the seen pool. With no history (or once every game has been seen) this is plain random.
-    """
     all_envs = list(EnvironmentName)
-    unseen = [e for e in all_envs if e not in seen_last_tournament]
-    seen = [e for e in all_envs if e in seen_last_tournament]
+    unseen = [env for env in all_envs if env not in seen_last_tournament]
+    seen = [env for env in all_envs if env in seen_last_tournament]
     random.shuffle(unseen)
     random.shuffle(seen)
     return (unseen + seen)[:num_envs]
@@ -211,7 +203,10 @@ async def _create_environment_boss_round_tasks(
 
     for i in range(len(tasks), t_cst.ENV_FINAL_ROUND_TASK_COUNT):
         model_override, start_point, hours = boss_task_configs[i]
-        logger.info(f"Boss round task {i+1}/{t_cst.ENV_FINAL_ROUND_TASK_COUNT}: start_point={start_point.value}, model={model_override}, hours={hours}")
+        logger.info(
+            f"Boss round task {i+1}/{t_cst.ENV_FINAL_ROUND_TASK_COUNT}: "
+            f"start_point={start_point.value}, model={model_override}, hours={hours}"
+        )
         task = await create_synthetic_env_task(
             config, models, instruct_datasets,
             num_environments=num_envs, round_number=round_data.round_number,
@@ -245,14 +240,13 @@ async def _create_environment_group_tasks(
     # R2+ must use the same base model as R1
     tournament_base_model = await _get_tournament_base_model(tournament_id, config) if round_data.round_number > 1 else None
 
-    # R1 prefers games not seen in the last tournament; R2+ inherit R1's env set via reference_task.
     r1_env_override: list[EnvironmentName] | None = None
     if round_data.round_number == 1:
         seen_last_tournament = await _get_prev_tournament_env_names(tournament_id, config)
         r1_env_override = _select_r1_env_names(num_envs, seen_last_tournament)
         logger.info(
-            f"R1 env selection: seen_last_tournament={sorted(e.value for e in seen_last_tournament)} "
-            f"-> selected={[e.value for e in r1_env_override]}"
+            f"R1 env selection: seen_last_tournament={sorted(env.value for env in seen_last_tournament)} "
+            f"-> selected={[env.value for env in r1_env_override]}"
         )
 
     models = _get_text_models(config.keypair)

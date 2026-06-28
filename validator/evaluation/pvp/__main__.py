@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 
-from core.constants import EnvironmentName
+import validator.evaluation.constants as vcst
+from core.constants.environments import EnvironmentName
 from core.models.pvp_models import ChatCompletionConfig
 from core.models.pvp_models import PreparedModel
 from core.models.pvp_models import PvPEnvironmentResult
@@ -23,7 +24,8 @@ from core.models.pvp_models import PvPEvalMetadata
 from core.models.pvp_models import PvPEvalResults
 from core.models.pvp_models import PvPModelSpec
 from core.pvp.sglang_parsers import tool_call_parser_for
-from validator.core import constants as vcst
+from validator.evaluation.evaluation_logging import configure_eval_logging
+from validator.evaluation.model_checks import check_for_lora
 from validator.evaluation.pvp.game_runner import Player
 from validator.evaluation.pvp.game_runner import create_player
 from validator.evaluation.pvp.game_runner import run_matchup
@@ -31,9 +33,7 @@ from validator.evaluation.pvp.game_runner import warmup_player
 from validator.evaluation.pvp.materialize import materialize_base_model
 from validator.evaluation.pvp.server import start_sglang
 from validator.evaluation.pvp.server import wait_for_servers
-from validator.evaluation.utils import check_for_lora
-from validator.evaluation.utils import configure_eval_logging
-from validator.evaluation.utils import stop_process
+from validator.evaluation.runtime import stop_process
 
 
 logger = logging.getLogger(__name__)
@@ -83,10 +83,6 @@ def _prepare_model(spec: PvPModelSpec, label: str, gpu_id: int | None = None) ->
     logger.info("Model %s: repo=%s is_lora=%s base_chain=%s", label, spec.repo, is_lora, spec.base_chain)
 
     if is_lora:
-        # Serve the adapter on the base it trained on: foundation for round 1, or
-        # foundation + previous adapter(s) for a continuation miner (base_chain).
-        # `label` keeps each model's merge scratch dir distinct; merge on this
-        # model's own GPU so the two preparations don't pile onto one device.
         device = f"cuda:{gpu_id}" if gpu_id is not None else None
         base_path = materialize_base_model(spec.original_model, spec.base_chain, label=label, device=device)
         lora_name = f"{label}_trained_lora"
@@ -94,8 +90,6 @@ def _prepare_model(spec: PvPModelSpec, label: str, gpu_id: int | None = None) ->
             sglang_model_path=base_path,
             inference_name=f"{base_path}:{lora_name}",
             extra_sglang_args=f"--enable-lora --lora-paths {lora_name}={spec.repo} --lora-backend triton",
-            # A materialized base is a local dir with no family substring, so resolve
-            # its parser from config.json; for a plain repo the server resolves it.
             tool_call_parser=tool_call_parser_for(base_path) if spec.base_chain else None,
         )
 

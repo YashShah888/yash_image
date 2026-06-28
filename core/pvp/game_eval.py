@@ -13,10 +13,10 @@ import numpy as np
 import pyspiel
 from open_spiel.python.algorithms import evaluate_bots
 
-from core.constants import ENVIRONMENT_CONFIGS
-from core.constants import EnvironmentConfig
-from core.constants import EnvironmentName
-from core.constants import EvalType
+from core.constants.environments import ENVIRONMENT_CONFIGS
+from core.constants.environments import EnvironmentConfig
+from core.constants.environments import EnvironmentName
+from core.constants.environments import EvalType
 from core.pvp import constants as cst
 from core.pvp.agents import BaseGameAgent
 from core.pvp.agents import ClobberAgent

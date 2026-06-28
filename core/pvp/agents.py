@@ -1,7 +1,8 @@
 """Game-specific agents for PvP evaluation.
 
 Each agent provides state formatting and parameter generation for its game.
-Rules text is loaded from core/config/pvp_game_prompts.yml.
+Rules text is loaded from the repo prompt YAML, with a core-local fallback for
+the model-prep image that ships only core/ plus trainer/model_prep/.
 """
 
 import functools
@@ -23,13 +24,20 @@ from core.models.pvp_models import LiarsDiceParams
 from core.models.pvp_models import OthelloParams
 
 
-_PROMPTS_PATH = Path(__file__).resolve().parents[2] / "core" / "config" / "pvp_game_prompts.yml"
+_PROMPTS_PATHS = (
+    Path(__file__).resolve().parents[2] / "validator" / "evaluation" / "pvp" / "game_prompts.yml",
+    Path(__file__).resolve().parent / "game_prompts.yml",
+)
 
 
 @functools.cache
 def load_prompts() -> dict[str, str]:
-    with open(_PROMPTS_PATH) as f:
-        return yaml.safe_load(f)
+    for prompts_path in _PROMPTS_PATHS:
+        if prompts_path.exists():
+            with open(prompts_path) as f:
+                return yaml.safe_load(f)
+    searched = ", ".join(str(path) for path in _PROMPTS_PATHS)
+    raise FileNotFoundError(f"PvP prompt YAML not found. Checked: {searched}")
 
 
 class BaseGameAgent(ABC):
@@ -51,6 +59,9 @@ class BaseGameAgent(ABC):
         """Generate pyspiel game parameters from a config variant ID."""
         ...
 
+    def load_game(self, params: GameParams) -> pyspiel.Game:
+        return pyspiel.load_game(self.game_name, params.to_pyspiel())
+
     def setup_initial_state(self, state: pyspiel.State, seed: int) -> None:
         """Advance the fresh state before the models take over. Default: no-op.
 
@@ -60,15 +71,6 @@ class BaseGameAgent(ABC):
         same seed reproduces the same start while different seeds diverge.
         """
         return None
-
-    def load_game(self, params: GameParams) -> pyspiel.Game:
-        """Build the pyspiel game this agent plays.
-
-        Default: load game_name with params directly. Games whose native dynamics
-        are simultaneous (e.g. goofspiel) override this to wrap the game so the
-        sequential LLMBot/evaluate_bots harness can drive it.
-        """
-        return pyspiel.load_game(self.game_name, params.to_pyspiel())
 
     def get_rules(self) -> str:
         return load_prompts()[self.rules_key]
@@ -175,7 +177,6 @@ class LeducPokerAgent(BaseGameAgent):
         public_card = self._extract(info_str, r"\[Public: (-?\d+)\]")
         round1_seq = self._extract(info_str, r"\[Round1: ([^\]]*)\]")
         round2_seq = self._extract(info_str, r"\[Round2: ([^\]]*)\]")
-
         lines: list[str] = []
 
         if private_card and private_card != "-10000":
@@ -228,7 +229,7 @@ class LeducPokerAgent(BaseGameAgent):
         numbers = [int(x) for x in seq.split() if x.isdigit()]
         if not numbers:
             return "(none)"
-        return ", ".join(actions_map.get(a, f"Action{a}") for a in numbers)
+        return ", ".join(actions_map.get(action, f"Action{action}") for action in numbers)
 
 
 class GinRummyAgent(BaseGameAgent):
@@ -273,10 +274,6 @@ _CLOBBER_BOARD_SIZES = (
     (5, 5),
     (5, 6),
 )
-
-# Deck sizes goofspiel is played with, selected per game from the config id so
-# each game varies board size (and thus length) for SFT/eval diversity. 5 is a
-# short sharp game; 13 is the full standard deck.
 _GOOFSPIEL_NUM_CARDS = (5, 8, 10, 13)
 
 
@@ -333,19 +330,11 @@ class ClobberAgent(BaseGameAgent):
         return f"You play {colour}.\n{state.observation_string(player_id)}"
 
     def setup_initial_state(self, state: pyspiel.State, seed: int) -> None:
-        """Apply seeded opening plies, mirroring Othello's deterministic-game treatment."""
         _apply_seeded_random_opening(state, seed, _CLOBBER_OPENING_PLIES)
 
 
 class GoofspielAgent(BaseGameAgent):
-    """Goofspiel (a.k.a. the Game of Pure Strategy).
-
-    OpenSpiel's goofspiel is a SIMULTANEOUS-move game; the sequential harness
-    drives it via convert_to_turn_based, which hides each player's concurrent
-    bid from the other (so simultaneity and fairness are preserved). Played with
-    imp_info=True (opponent hand hidden) and returns_type=win_loss so terminal
-    returns are zero-sum {-1, 0, 1}, mapping straight to win/loss/draw.
-    """
+    """Goofspiel, wrapped from simultaneous moves into sequential turns."""
 
     @property
     def game_name(self) -> str:
@@ -366,14 +355,7 @@ class GoofspielAgent(BaseGameAgent):
         )
 
     def load_game(self, params: GameParams) -> pyspiel.Game:
-        """Load goofspiel and wrap its simultaneous moves into sequential turns."""
         return pyspiel.convert_to_turn_based(pyspiel.load_game(self.game_name, params.to_pyspiel()))
 
     def format_state(self, state: pyspiel.State, player_id: int) -> str:
-        """Render the player's own view; imp_info keeps the opponent's hand hidden.
-
-        observation_string already reports the current point card, the remaining
-        point cards, both running scores, this player's hand and the win sequence.
-        Prefix the player's identity since the board labels are absolute (P0/P1).
-        """
         return f"You are Player {player_id} (P{player_id}).\n{state.observation_string(player_id)}"

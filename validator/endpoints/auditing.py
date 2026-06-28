@@ -5,18 +5,18 @@ from fastapi import Query
 from loguru import logger
 from pydantic import BaseModel  # noqa
 
-from validator.core.config import Config
-from validator.core.dependencies import get_config
-from validator.core.models import AnyTypeTask
-from validator.core.models import AnyTypeTaskWithHotkeyDetails
-from core.models.tournament_models import DupRelationship
-from core.models.tournament_models import TournamentDedupReview
+from validator.app.config import Config
+from validator.app.dependencies import get_config
 from validator.db.sql.auditing import get_latest_scores_url
 from validator.db.sql.auditing import get_recent_tasks
 from validator.db.sql.auditing import get_recent_tasks_for_hotkey
 from validator.db.sql.auditing import get_task_with_hotkey_details
 from validator.db.sql.dedup import get_resolved_dedup_reviews
-from validator.utils.minio import async_minio_client
+from validator.infrastructure.minio_client import async_minio_client
+from validator.tasks.models import AnyTypeTask
+from validator.tasks.models import AnyTypeTaskWithHotkeyDetails
+from validator.tournament.models import DupRelationship
+from validator.tournament.models import TournamentDedupReview
 
 
 router = APIRouter(tags=["auditing"])
@@ -75,8 +75,6 @@ async def audit_dedup_reviews_endpoint(
     # report_url is stored as a presigned S3 URL that expires (~7 days); re-sign on read so
     # the public audit link doesn't go dead after the original signature lapses.
     for review in reviews:
-        # DISTINCT verdict reasons describe how non-flagged miners' repos differ (their
-        # training innovations) — keep them in the DB but out of the public payload.
         review.pair_verdicts = [v for v in review.pair_verdicts if v.relationship != DupRelationship.DISTINCT]
         if review.report_url:
             fresh_url = await async_minio_client.get_new_presigned_url(review.report_url)

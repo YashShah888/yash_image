@@ -19,7 +19,7 @@ import time
 
 import aiohttp
 
-from core.constants import EnvironmentName
+from core.constants.environments import EnvironmentName
 from core.models.model_prep_models import EnvBaselineConfig
 from core.models.model_prep_models import EnvBaselineStats
 from core.models.model_prep_models import EnvStats
@@ -27,16 +27,15 @@ from core.models.pvp_models import ChatCompletionConfig
 from core.pvp import constants as pvp_cst
 from core.pvp.baseline import run_mcts_baseline
 from core.pvp.baseline import supports_in_harness_baseline
-from core.pvp.sglang_launch import build_base_command
-from core.pvp.sglang_parsers import tool_call_parser_for
 from core.pvp.chat import chat_completion
 from core.pvp.chat import create_client
-from trainer.model_prep.stats import compute_weight_stats
+from core.pvp.sglang_launch import build_base_command
+from core.pvp.sglang_parsers import tool_call_parser_for
 
 
 logger = logging.getLogger(__name__)
 
-# Default SGLang CLI flags (inlined from validator.core.constants)
+# Default SGLang CLI flags (inlined from validator.constants)
 SGLANG_EXTRA_CLI_DEFAULT = (
     "--attention-backend triton --prefill-attention-backend triton "
     "--decode-attention-backend triton --sampling-backend pytorch"
@@ -47,8 +46,7 @@ ENV_EVAL_TASK_TIMEOUT = 150
 CONSECUTIVE_FAILURE_LIMIT = 5
 # Per-env wall-clock budget for the in-harness baseline (soft cap: checked
 # between games, so an in-flight game can overshoot). Overrun returns a partial
-# tally instead of blowing the validator's dispatch timeout — keep
-# (num envs x budget) + startup costs under MODEL_PREP_TIMEOUT_SECONDS.
+# tally instead of blowing the validator's dispatch timeout.
 ENV_BASELINE_TIME_BUDGET_SECONDS = float(os.getenv("MODEL_PREP_ENV_TIME_BUDGET_SECONDS", "540"))
 
 
@@ -62,6 +60,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 LOG_SGLANG_STDOUT = _env_bool("MODEL_PREP_LOG_SGLANG", False)
+
+
+def compute_weight_stats(model):
+    from trainer.model_prep.stats import compute_weight_stats as _compute_weight_stats
+
+    return _compute_weight_stats(model)
 
 
 def build_sglang_command(model_path: str, seed: int) -> str:
@@ -156,6 +160,14 @@ def _format_episode_error(error: object) -> str:
         return ""
     message = str(error).strip()
     return message or type(error).__name__
+
+
+def _container_host_ip() -> str:
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError as exc:
+        logger.warning("Failed to resolve container hostname; falling back to localhost: %s", exc)
+        return "127.0.0.1"
 
 
 async def _play_episodes(
@@ -253,23 +265,15 @@ def _mcts_baseline_stats(
     num_episodes: int,
     eval_payload_extra: dict | None,
 ) -> EnvStats:
-    """Play num_episodes baseline games of the model vs in-harness MCTS.
-
-    Uses the same tool-calling format as eval (core.pvp), so the baseline is
-    measured consistently with how the model is evaluated — no external server.
-    """
+    """Play num_episodes baseline games of the model vs in-harness MCTS."""
     extra = eval_payload_extra or {}
     mcts_simulations = extra.get("mcts_max_simulations")
 
     config = ChatCompletionConfig(
         inference_model=model_name,
-        # Local weights dir holds the tokenizer, so slot budgets use real tokens
-        # (model_name is only a basename and would fall back to word counting).
         tokenizer_repo=model_path,
         base_url=sglang_base_url,
         temperature=ENV_EVAL_TEMPERATURE,
-        # Keep HTTP failure detection under the turn wall-clock alarm, as in eval —
-        # the model defaults (30s/10 retries) could never fit a 15s turn.
         read_timeout=pvp_cst.PVP_HTTP_READ_TIMEOUT_SECONDS,
         max_retries=pvp_cst.PVP_HTTP_MAX_RETRIES,
     )
@@ -286,7 +290,6 @@ def _mcts_baseline_stats(
         time_budget_seconds=ENV_BASELINE_TIME_BUDGET_SECONDS,
     )
 
-    # Per-game scores (win=1, draw=0.5, loss=0) -> the usual EnvStats summary.
     scores = [1.0] * result.wins + [0.5] * result.draws + [0.0] * result.losses
     stats = _build_env_stats(scores)
     print(f"  {env_name.value}: {result.num_games} games, mean={stats.mean_score:.3f}", flush=True)
@@ -313,7 +316,7 @@ async def compute_env_stats(
     sglang_log_task = None
     sglang_port = int(os.getenv("SGLANG_PORT", "30000"))
     sglang_local_url = f"http://localhost:{sglang_port}"
-    container_ip = socket.gethostbyname(socket.gethostname())
+    container_ip = _container_host_ip()
     sglang_base_url = f"http://{container_ip}:{sglang_port}/v1"
     model_name = os.path.basename(model_path)
 
@@ -330,9 +333,6 @@ async def compute_env_stats(
 
         async with aiohttp.ClientSession() as session:
             for env_name, cfg in env_configs.items():
-                # One env failing must not take down the others (or the container):
-                # it degrades to empty stats, mirroring the HTTP path's per-episode
-                # error handling.
                 try:
                     if supports_in_harness_baseline(env_name):
                         all_stats[env_name] = _mcts_baseline_stats(

@@ -53,6 +53,37 @@ async def get_dataset_test_losses(ds_name: str, psql_db: PSQLDB) -> list[float]:
         return [float(row[cst.TEST_LOSS]) for row in rows]
 
 
+async def get_lowest_loss_repo_for_task(task_id: UUID, psql_db: PSQLDB) -> str | None:
+    """Return the submission repo with the strictly lowest eval (test) loss for a task, or None.
+
+    Continuous-SFT carry-forward wants the genuinely best model, not the handicap-adjusted boss-round
+    winner (which can have higher raw loss). Guarded to this NETUID + positive quality_score (mirrors
+    get_task_winner) so a penalized cheat with low raw test_loss can't become the next lineage base.
+    """
+    async with await psql_db.connection() as connection:
+        connection: Connection
+        row = await connection.fetchrow(
+            f"""
+            SELECT submissions.{cst.REPO}
+            FROM {cst.SUBMISSIONS_TABLE} submissions
+            JOIN {cst.TASK_NODES_TABLE} task_nodes
+              ON submissions.{cst.TASK_ID} = task_nodes.{cst.TASK_ID}
+              AND submissions.{cst.HOTKEY} = task_nodes.{cst.HOTKEY}
+              AND submissions.{cst.NETUID} = task_nodes.{cst.NETUID}
+            WHERE submissions.{cst.TASK_ID} = $1
+              AND task_nodes.{cst.NETUID} = $2
+              AND task_nodes.{cst.TEST_LOSS} IS NOT NULL
+              AND task_nodes.{cst.TASK_NODE_QUALITY_SCORE} IS NOT NULL
+              AND task_nodes.{cst.TASK_NODE_QUALITY_SCORE} > 0
+            ORDER BY task_nodes.{cst.TEST_LOSS} ASC
+            LIMIT 1
+            """,
+            task_id,
+            NETUID,
+        )
+        return row[cst.REPO] if row else None
+
+
 def _row_count(command_tag: str) -> int:
     try:
         return int(command_tag.split()[-1])

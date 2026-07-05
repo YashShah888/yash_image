@@ -22,6 +22,7 @@ from core.models.task_models import TaskStatus
 from validator.app.config import Config
 from validator.db.database import PSQLDB
 from validator.db.sql import tasks as task_sql
+from validator.db.sql.continuous_sft import advance_continuous_sft_state
 from validator.db.sql.nodes import get_all_nodes
 from validator.db.sql.nodes import get_node_by_hotkey
 from validator.db.sql.tournaments import add_tournament_participants
@@ -329,6 +330,45 @@ async def _save_winner_model_repo(
         logger.warning(f"Could not find winner model repo for {winner_hotkey} in tournament {tournament_id}")
 
 
+async def _carry_forward_continuous_sft(
+    round_tasks: list[TournamentTask], source_round_id: str, psql_db: PSQLDB
+) -> None:
+    """After a TEXT boss round, carry each lineage's lowest-eval-loss winner forward as its next base
+    and advance continuous_sft_state (idempotent on source_round_id, so reprocessing can't double-advance).
+    """
+    found = False
+    for round_task in round_tasks:
+        task_obj = await task_sql.get_task(round_task.task_id, psql_db)
+        if not task_obj:
+            continue
+        if not t_cst.is_continuous_sft_task(task_obj):
+            continue
+        lineage = t_cst.continuous_sft_lineage_from_ds(task_obj.ds)
+        if not lineage:
+            logger.warning(
+                f"Continuous-SFT task {round_task.task_id} has no lineage in ds={task_obj.ds}; skipping carry-forward"
+            )
+            continue
+        found = True
+
+        # Carried as-is (a LoRA winner is flattened by next round's model-prep); None when the week
+        # had no scored winner, in which case advance preserves the prior repo.
+        winner_repo = await task_sql.get_lowest_loss_repo_for_task(round_task.task_id, psql_db)
+        logger.info(
+            f"Continuous-SFT carry-forward: lineage={lineage} task={round_task.task_id} "
+            f"carried_winner={winner_repo}"
+        )
+        try:
+            await advance_continuous_sft_state(lineage, winner_repo, source_round_id, psql_db)
+        except Exception as e:
+            logger.error(
+                f"Failed to advance continuous_sft_state[{lineage}] for task {round_task.task_id}: {e}", exc_info=True
+            )
+
+    if not found:
+        logger.info("No continuous-SFT task in completed text boss round; nothing to carry forward")
+
+
 def select_boss_group_index(groups: list[Group]) -> int:
     """Return the index of the smallest group for boss injection."""
     return min(range(len(groups)), key=lambda index: len(groups[index].member_ids))
@@ -626,6 +666,11 @@ async def advance_tournament(tournament: TournamentData, completed_round: Tourna
             # Get task IDs for logging
             task_ids = [task.task_id for task in round_tasks]
             logger.info(f"Tournament task IDs: {task_ids}")
+
+            # BEFORE setting winner_hotkey (the re-entry guard): set-first-then-crash would freeze the
+            # lineages; carry-forward is idempotent so a crash before winner-set just reprocesses.
+            if tournament.tournament_type == TournamentType.TEXT:
+                await _carry_forward_continuous_sft(round_tasks, completed_round.round_id, psql_db)
 
             await update_tournament_winner_hotkey(tournament.tournament_id, winner, psql_db)
             # await update_tournament_status(tournament.tournament_id, TournamentStatus.COMPLETED, psql_db)
@@ -1237,6 +1282,18 @@ async def is_tourn_task_completed(
 
     Returns a tuple of (is_completed, reason)
     """
+
+    # Pre-boss quasar task with both miners' trainings failed (2 trainings, so the >0.5 threshold
+    # means both): complete the round instead of stalling for investigation. Neither miner gets a
+    # quality score, so get_task_winner yields None, winners come back empty, and advance_tournament's
+    # zero-winner path retains the boss as tournament winner — no boss round, no emission shift.
+    pre_boss_both_failed = (
+        task_obj.status in (TaskStatus.SUCCESS.value, TaskStatus.FAILURE.value)
+        and t_cst.is_pre_boss_quasar_task(task_obj)
+        and await _more_than_half_failures(tournament_task, config)
+    )
+    if pre_boss_both_failed:
+        return True, "Both pre-boss miners failed the quasar task; completing round so the boss is retained"
 
     if task_obj.status == TaskStatus.SUCCESS.value:
         if await _more_than_half_failures(tournament_task, config):

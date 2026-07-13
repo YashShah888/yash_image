@@ -331,12 +331,17 @@ async def run_evaluation_basilica_image(
     if not test_split_url.startswith("http://") and not test_split_url.startswith("https://"):
         raise ValueError("Basilica image eval expects TEST_SPLIT_URL to be an S3/HTTP URL.")
     command = ["/app/start.sh"]
-    source = create_basilica_eval_runner_source(command, CONTAINER_EVAL_RESULTS_PATH)
+    source = create_basilica_eval_runner_source(
+        command,
+        CONTAINER_EVAL_RESULTS_PATH,
+        prepare_image_models=True,
+    )
 
     base_env = {
         "ORIGINAL_MODEL_REPO": original_model_repo,
         "MODEL_TYPE": model_type.value,
         "TRANSFORMERS_ALLOW_TORCH_LOAD": "true",
+        "PYTHONUNBUFFERED": "1",
         **vcst.HF_CONTAINER_ENV_IMAGE,
     }
 
@@ -354,7 +359,7 @@ async def run_evaluation_basilica_image(
         repos=models,
         model_name=original_model_repo,
         task_type="image",
-        image="diagonalge/tuning_validator_diffusion:basilica",
+        image=docker_cst.VALIDATOR_DOCKER_IMAGE_DIFFUSION,
         source=source,
         build_env_for_repo=build_env_for_repo,
         gpu_count=max(1, num_gpus),

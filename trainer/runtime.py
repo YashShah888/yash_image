@@ -189,7 +189,10 @@ async def run_trainer_container_image(
     if trigger_word:
         command += ["--trigger-word", trigger_word]
 
-    environment: dict[str, str] = {"TRANSFORMERS_CACHE": cst.HUGGINGFACE_CACHE_PATH}
+    environment: dict[str, str] = {
+        "TRANSFORMERS_CACHE": cst.HUGGINGFACE_CACHE_PATH,
+        "HF_HOME": cst.HUGGINGFACE_CACHE_PATH,
+    }
     if baseline_stats:
         vol = client.volumes.get(cst.CACHE_VOLUME_NAME)
         stats_filename = f"baseline_stats_{task_id}.json"
@@ -410,10 +413,12 @@ def run_downloader_container(
     container_name = f"downloader-{task_id}-{str(uuid.uuid4())[:8]}"
     container = None
 
-    environment = {}
+    environment = {
+        "HUGGINGFACE_TOKEN": os.environ.get("HUGGINGFACE_TOKEN", ""),
+        "HUGGINGFACE_USERNAME": os.environ.get("HUGGINGFACE_USERNAME", ""),
+    }
     if anonymize:
         environment["MODEL_HASH_SALT"] = os.environ.get("MODEL_HASH_SALT", "")
-
     try:
         logger.info(f"Starting downloader container: {container_name}", extra=log_labels)
         container = client.containers.run(
@@ -612,10 +617,7 @@ def run_model_prep_container(
     if env_configs_with_urls:
         command += ["--env-configs", json.dumps(env_configs_with_urls)]
 
-    env = {
-        "HUGGINGFACE_TOKEN": os.environ.get("HUGGINGFACE_TOKEN", ""),
-        "HUGGINGFACE_USERNAME": os.environ.get("HUGGINGFACE_USERNAME", ""),
-    }
+    env = {}
     if continuous_sft_remote_code_repo:
         # Signals the entrypoint to pin the model's custom-arch code to this audited mirror and load
         # with trust_remote_code (custom-arch continuous-SFT lineages, e.g. quasar).
@@ -848,11 +850,7 @@ def get_task_type(request: TrainerProxyRequest) -> TaskType:
 def get_dockerfile_path(task_type: TaskType, training_data, local_repo_path: str) -> str:
     """Get the appropriate dockerfile path based on task type and model type"""
     if task_type == TaskType.IMAGETASK:
-        model_type = training_data.model_type
-        if model_type in [ImageModelType.Z_IMAGE, ImageModelType.QWEN_IMAGE]:
-            return _resolve_dockerfile_path(local_repo_path, cst.IMAGE_TOOLKIT_DOCKERFILE_PATHS)
-        else:
-            return _resolve_dockerfile_path(local_repo_path, cst.IMAGE_DOCKERFILE_PATHS)
+        return _resolve_dockerfile_path(local_repo_path, cst.IMAGE_TOOLKIT_DOCKERFILE_PATHS)
 
     else:
         return _resolve_dockerfile_path(local_repo_path, cst.TEXT_DOCKERFILE_PATHS)

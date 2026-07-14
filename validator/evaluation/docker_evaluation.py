@@ -257,7 +257,11 @@ async def run_evaluation_basilica_text(
         deployment_ids_by_repo=deployment_ids_str,
         local_logging=local_logging,
         persist_deployment_ids=not is_environment_eval,
-        reserve_deployment_id=False,
+        # Stamp deployment_id at reserve time for text/instruct evals so a bouncing deploy stays
+        # tracked. Left off for environment evals: their eval rows are long-lived across the whole
+        # group+pair eval, and stamping a group-deploy id there would let a mid-eval ghost-reset
+        # clobber the row (env pair deployments are tracked separately on pvp_pair_results).
+        reserve_deployment_id=not is_environment_eval,
     )
 
     evaluation_results = _collect_repo_evaluation_results(models, repo_results)
@@ -326,6 +330,9 @@ async def run_evaluation_basilica_grpo(
         psql_db=psql_db,
         repo_to_hotkey=repo_to_hotkey,
         deployment_ids_by_repo=deployment_ids_str,
+        # Track every pod at reserve time (see image path) so a deploy that never reaches readiness
+        # can't leak as an untracked orphan.
+        reserve_deployment_id=True,
     )
 
     evaluation_results = _collect_repo_evaluation_results(models, repo_results)
@@ -391,6 +398,11 @@ async def run_evaluation_basilica_image(
         psql_db=psql_db,
         repo_to_hotkey=repo_to_hotkey,
         deployment_ids_by_repo=deployment_ids_str,
+        # Stamp deployment_id on the eval row at reserve time (pre-deploy). Image (FLUX) deploys
+        # bounce on GPU capacity and often never reach readiness, so the readiness-callback persist
+        # never fires — leaving a live-but-untracked pod that only the slow orphan grace reaps.
+        # Reserving under the deployment name keeps every image pod tracked from birth.
+        reserve_deployment_id=True,
     )
 
     evaluation_results = _collect_repo_evaluation_results(models, repo_results)
@@ -591,6 +603,21 @@ async def _deploy_pvp_eval(
                         f"Not enough evaluation GPU capacity for PvP deployment {deployment_name} ({gpu_count} GPUs)"
                     )
                 reserved_pair = True
+                # Stamp deployment_id in the DB *before* client.deploy. The deploy name is a fixed
+                # uuid (see above) that Basilica reuses as the deployment name, so we know it up
+                # front. Without this, a pod created by a deploy that then hangs past its timeout
+                # carries a NULL deployment_id (the readiness-callback persist never runs): the
+                # stale-reservation sweep frees its GPU slot while the pod stays live on Basilica,
+                # leaving an untracked orphan that only the slow orphan-grace reaps — so they pile
+                # up faster than they age out. Stamping here guarantees every live pod is trackable
+                # (matched by the reconciler, deleted by cleanup, or freed via the fast ghost path).
+                await _persist_pvp_deployment_id(
+                    task_id=task_id,
+                    psql_db=psql_db,
+                    hotkeys=hotkeys,
+                    deployment_name=deployment_name,
+                    ctx=ctx,
+                )
             log_step(
                 "deploy_start",
                 deployment=deployment_name,

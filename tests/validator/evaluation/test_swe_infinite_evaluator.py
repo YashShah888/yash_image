@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 import core.constants.environments as env_cst
@@ -149,3 +151,111 @@ async def test_run_swe_evaluation_counts_session_timeouts_as_zero(monkeypatch):
     )
 
     assert avg == 0.5
+
+
+@pytest.mark.asyncio
+async def test_run_swe_evaluation_retries_connector_errors(monkeypatch):
+    attempts = 0
+
+    async def flaky_post(_session, _swe_server_url, _payload, _task_timeout, _eval_config):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            connection_key = SimpleNamespace(host="swe.example", port=8000, ssl=True)
+            raise aiohttp.ClientConnectorError(connection_key, OSError(113, "Connect call failed"))
+        return {"score": 0.75, "time_taken": 0.01}
+
+    monkeypatch.setattr(swe, "_post_affinetes_evaluate", flaky_post)
+    eval_config = DEFAULT_SWE_INFINITE_EVAL_CONFIG.with_overrides(connect_retry_backoff_seconds=0.0)
+
+    avg = await swe._run_swe_evaluation(
+        swe_server_url="https://swe.example",
+        model_base_url="https://model.example/v1",
+        inference_model_name="org/model",
+        eval_list=[(101, 1)],
+        temperature=0.0,
+        task_timeout=60,
+        eval_config=eval_config,
+    )
+
+    assert attempts == 3
+    assert avg == 0.75
+
+
+@pytest.mark.asyncio
+async def test_run_swe_evaluation_counts_exhausted_connector_retries_as_zero(monkeypatch):
+    attempts = 0
+
+    async def failing_post(_session, _swe_server_url, _payload, _task_timeout, _eval_config):
+        nonlocal attempts
+        attempts += 1
+        connection_key = SimpleNamespace(host="swe.example", port=8000, ssl=True)
+        raise aiohttp.ClientConnectorError(connection_key, OSError(113, "Connect call failed"))
+
+    monkeypatch.setattr(swe, "_post_affinetes_evaluate", failing_post)
+    eval_config = DEFAULT_SWE_INFINITE_EVAL_CONFIG.with_overrides(connect_retry_backoff_seconds=0.0)
+
+    avg = await swe._run_swe_evaluation(
+        swe_server_url="https://swe.example",
+        model_base_url="https://model.example/v1",
+        inference_model_name="org/model",
+        eval_list=[(101, 1)],
+        temperature=0.0,
+        task_timeout=60,
+        eval_config=eval_config,
+    )
+
+    assert attempts == 3
+    assert avg == 0.0
+
+
+@pytest.mark.asyncio
+async def test_prepare_sglang_command_uses_pvp_native_lora_path_even_with_added_tokens(monkeypatch):
+    monkeypatch.setattr(swe, "check_for_lora", lambda *_args: True)
+    monkeypatch.setattr(swe, "check_lora_has_added_tokens", lambda *_args: True, raising=False)
+    monkeypatch.setattr(
+        swe,
+        "materialize_base_model",
+        lambda original_model, base_chain, label: f"/tmp/{label}-base",
+    )
+    monkeypatch.setattr(swe, "tool_call_parser_for", lambda *_args, **_kwargs: "qwen25")
+
+    def fail_if_merged(*_args, **_kwargs):
+        raise AssertionError("SWE LoRAs must use the PvP native serving path")
+
+    monkeypatch.setattr(swe, "_merge_base_and_lora", fail_if_merged, raising=False)
+
+    inference_name, model_path, command = await swe._prepare_sglang_command(
+        model_repo="org/candidate-with-added-tokens",
+        original_model="Qwen/Qwen2.5-3B-Instruct",
+        base_chain=["org/previous-round"],
+        base_seed=42,
+    )
+
+    assert model_path == "/tmp/cand-base"
+    assert inference_name == "/tmp/cand-base:cand_trained_lora"
+    assert "--model-path /tmp/cand-base" in command
+    assert "--enable-lora" in command
+    assert "--lora-paths cand_trained_lora=org/candidate-with-added-tokens" in command
+    assert "--lora-backend triton" in command
+    assert "--tool-call-parser qwen25" in command
+
+
+@pytest.mark.asyncio
+async def test_prepare_sglang_command_full_weights_matches_pvp_startup(monkeypatch):
+    monkeypatch.setattr(swe, "check_for_lora", lambda *_args: False)
+    monkeypatch.setattr(swe, "tool_call_parser_for", lambda *_args, **_kwargs: "qwen25")
+    monkeypatch.setenv("SGLANG_PORT", "31000")
+
+    inference_name, model_path, command = await swe._prepare_sglang_command(
+        model_repo="org/full-weights",
+        original_model="Qwen/Qwen2.5-3B-Instruct",
+        base_chain=[],
+        base_seed=7,
+    )
+
+    assert inference_name == model_path == "org/full-weights"
+    assert "--model-path org/full-weights" in command
+    assert "--port 31000" in command
+    assert "--random-seed 7" in command
+    assert "--tool-call-parser qwen25" in command

@@ -1,205 +1,159 @@
-"""
-Task-shape classification for image tournament tasks.
-
-Every image LoRA task is one of two training *shapes*:
-
-  subject — one identity held consistent across the set (a person or a single
-            product). The recipe should lock that identity in with a lower
-            adapter rank so the network doesn't waste capacity on background
-            variety it needs to ignore.
-  style   — a shared aesthetic/format applied across diverse subjects (an art
-            style, a logo system, a social template, a UI design). The recipe
-            needs more adapter capacity to carry the transferable pattern
-            without memorising any one example.
-
-We first vote from the dataset's caption text (six human-readable categories
-that collapse onto the two shapes below), because these datasets are
-synthetic and the caption is deliberately descriptive of what the image
-*is*, not just what it shows. When caption text is ambiguous (roughly tied
-category scores) we optionally break the tie with a cheap, purely offline
-image-content signal (perceptual-hash spread across the set): a tight
-cluster of near-identical crops reads as "subject", a wide spread of visually
-distinct images reads as "style". The image signal only ever resolves an
-ambiguous caption vote — a confident caption vote is never overridden by it,
-since the caption is the higher-trust signal for this dataset design.
-"""
+"""Classify an image task without network access or heavyweight models."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from dataclasses import field
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
 
-
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 CATEGORIES = ("person", "product", "style", "logo", "social", "design")
 SUBJECT_CATEGORIES = frozenset({"person", "product"})
 STYLE_CATEGORIES = frozenset({"style", "logo", "social", "design"})
-FALLBACK_CATEGORY = "style"
 
-# Independent keyword lists (not derived from any other miner's taxonomy —
-# these are generic English descriptors for each category, picked to have
-# low overlap with each other).
 _KEYWORDS: dict[str, tuple[str, ...]] = {
     "person": (
-        "man", "woman", "person", "portrait", "face", "boy", "girl", "guy",
-        "he ", "she ", "his ", "her ", "selfie", "headshot", "smiling",
-        "wearing", "hair", "eyes", "model", "actor", "actress",
+        "portrait", "person", "man", "woman", "boy", "girl", "face",
+        "headshot", "selfie", "hair", "eyes", "wearing", "character",
     ),
     "product": (
-        "product", "bottle", "packaging", "box", "jar", "device", "gadget",
-        "shoe", "sneaker", "watch", "bag", "container", "label", "studio shot",
-        "isolated on", "white background", "e-commerce", "catalog",
+        "product", "bottle", "package", "packaging", "box", "jar", "shoe",
+        "sneaker", "watch", "bag", "device", "gadget", "catalog", "e-commerce",
     ),
     "logo": (
-        "logo", "wordmark", "emblem", "brandmark", "monogram", "icon set",
-        "letterhead", "insignia",
+        "logo", "wordmark", "brandmark", "emblem", "monogram", "insignia",
+        "identity mark", "icon set",
     ),
     "social": (
-        "instagram", "social media", "story template", "post template",
-        "carousel", "thumbnail", "banner ad", "flyer", "headline",
-        "call to action", "cta",
+        "social media", "instagram", "story", "post template", "carousel",
+        "thumbnail", "banner", "flyer", "call to action", "headline",
     ),
     "design": (
-        "ui", "app screen", "dashboard", "wireframe", "mockup", "website",
-        "landing page", "interface", "button", "screen design", "web design",
+        "interface", "dashboard", "app screen", "landing page", "website",
+        "wireframe", "ui ", "ux ", "layout", "screen design", "mockup",
     ),
     "style": (
-        "style", "aesthetic", "art style", "painting", "illustration",
-        "rendered in", "in the style of", "artstyle", "texture", "palette",
-        "brushwork", "digital art", "concept art",
+        "style", "aesthetic", "illustration", "painting", "brushwork",
+        "rendered", "artwork", "palette", "texture", "concept art",
     ),
 }
 
 
-def _score_caption(text: str) -> dict[str, int]:
-    lowered = text.lower()
-    return {cat: sum(lowered.count(kw) for kw in kws) for cat, kws in _KEYWORDS.items()}
+@dataclass(frozen=True)
+class ShapeResult:
+    category: str
+    is_subject: bool
+    confidence: float
+    text_scores: dict[str, float]
+    image_diversity: float | None = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def confident_from_text(self) -> bool:
+        return self.confidence >= 0.25
+
+    @property
+    def image_signal_used(self) -> bool:
+        return self.image_diversity is not None and not self.confident_from_text
 
 
-def classify_from_captions(captions: list[str]) -> tuple[str, bool]:
-    """Return (category, confident). `confident` is False when the top two
-    categories are within one point of each other, or there is no signal at
-    all — callers should treat a low-confidence result as eligible for the
-    image-signal tie-break."""
-    totals: dict[str, int] = {cat: 0 for cat in CATEGORIES}
-    for caption in captions:
-        if not caption:
-            continue
-        scored = _score_caption(caption)
-        for cat, val in scored.items():
-            totals[cat] += val
-
-    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-    top_cat, top_score = ranked[0]
-    second_score = ranked[1][1] if len(ranked) > 1 else 0
-
-    if top_score == 0:
-        return FALLBACK_CATEGORY, False
-    confident = (top_score - second_score) >= 2
-    return top_cat, confident
+def read_captions(image_dir: str | Path) -> list[str]:
+    root = Path(image_dir)
+    if not root.is_dir():
+        return []
+    captions: list[str] = []
+    for path in sorted(root.iterdir()):
+        if path.is_file() and path.suffix.lower() == ".txt":
+            try:
+                value = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if value:
+                captions.append(value)
+    return captions
 
 
-def _phash_spread(image_paths: list[str]) -> float | None:
-    """Mean pairwise perceptual-hash Hamming distance across a sample of the
-    dataset, normalised to [0, 1] (0 = every image looks alike, 1 = maximally
-    diverse for a 64-bit hash). Returns None if PIL/imagehash aren't
-    installed or there aren't enough images to compare — callers must treat
-    that as "no signal", never as a hard failure."""
+def list_images(image_dir: str | Path) -> list[str]:
+    root = Path(image_dir)
+    if not root.is_dir():
+        return []
+    return [
+        str(path)
+        for path in sorted(root.iterdir())
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+    ]
+
+
+def _keyword_scores(captions: list[str]) -> dict[str, float]:
+    scores = {category: 0.0 for category in CATEGORIES}
+    joined = " ".join(captions).lower()
+    joined = re.sub(r"\s+", " ", joined)
+    for category, words in _KEYWORDS.items():
+        for keyword in words:
+            # Longer phrases are more diagnostic than single common words.
+            weight = 1.0 + min(1.0, keyword.count(" ") * 0.45)
+            scores[category] += joined.count(keyword) * weight
+    return scores
+
+
+def _phash_diversity(paths: list[str]) -> float | None:
+    """Mean normalized pairwise pHash distance on at most 24 images."""
     try:
         import imagehash
         from PIL import Image
     except ImportError:
         return None
 
-    sample = image_paths[:24]
-    if len(sample) < 3:
-        return None
-
     hashes = []
-    for path in sample:
+    for path in paths[:24]:
         try:
-            with Image.open(path) as img:
-                hashes.append(imagehash.phash(img))
+            with Image.open(path) as image:
+                hashes.append(imagehash.phash(image.convert("RGB")))
         except Exception:
             continue
     if len(hashes) < 3:
         return None
 
-    total = 0
+    total = 0.0
     pairs = 0
-    for i in range(len(hashes)):
-        for j in range(i + 1, len(hashes)):
-            total += hashes[i] - hashes[j]
+    for index, first in enumerate(hashes):
+        for second in hashes[index + 1 :]:
+            total += float(first - second) / 64.0
             pairs += 1
-    if pairs == 0:
-        return None
-    return (total / pairs) / 64.0
-
-
-@dataclass
-class ShapeResult:
-    category: str
-    is_subject: bool
-    confident_from_text: bool
-    image_signal_used: bool = False
-    notes: list[str] = field(default_factory=list)
-
-
-def resolve_shape(category: str) -> bool:
-    """category -> is_subject."""
-    cat = (category or "").lower().strip()
-    if cat in SUBJECT_CATEGORIES:
-        return True
-    if cat in STYLE_CATEGORIES:
-        return False
-    return False
+    return total / pairs if pairs else None
 
 
 def classify(captions: list[str], image_paths: list[str] | None = None) -> ShapeResult:
-    category, confident = classify_from_captions(captions)
-    result = ShapeResult(category=category, is_subject=resolve_shape(category), confident_from_text=confident)
+    scores = _keyword_scores(captions)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_category, best = ranked[0]
+    second = ranked[1][1]
+    total = sum(scores.values())
+    confidence = 0.0 if best <= 0 else min(1.0, (best - second) / max(best, 1.0))
+    notes: list[str] = []
 
-    if confident or not image_paths:
-        return result
+    diversity = None
+    if best <= 0 or confidence < 0.25:
+        diversity = _phash_diversity(image_paths or [])
+        if diversity is not None:
+            # Identity/product collections usually repeat a subject and therefore
+            # cluster more tightly than style/layout collections.
+            if diversity < 0.23:
+                best_category = "person"
+                notes.append(f"ambiguous text; low visual spread ({diversity:.3f}) => subject")
+            else:
+                best_category = "style"
+                notes.append(f"ambiguous text; high visual spread ({diversity:.3f}) => style")
+        elif best <= 0:
+            best_category = "style"
+            notes.append("no reliable category signal; conservative style fallback")
 
-    spread = _phash_spread(image_paths)
-    if spread is None:
-        result.notes.append("image tie-break unavailable; kept caption vote")
-        return result
-
-    # A tight cluster (low spread) under an ambiguous caption vote reads as a
-    # single held-consistent subject; a wide spread reads as style/format.
-    image_says_subject = spread < 0.18
-    if image_says_subject != result.is_subject:
-        result.is_subject = image_says_subject
-        if result.category not in (SUBJECT_CATEGORIES if image_says_subject else STYLE_CATEGORIES):
-            result.category = "person" if image_says_subject else "style"
-        result.image_signal_used = True
-        result.notes.append(f"image tie-break overrode ambiguous caption vote (spread={spread:.3f})")
-
-    return result
-
-
-def read_captions(image_dir: str) -> list[str]:
-    captions = []
-    if not os.path.isdir(image_dir):
-        return captions
-    for name in sorted(os.listdir(image_dir)):
-        if name.lower().endswith(".txt"):
-            try:
-                with open(os.path.join(image_dir, name), encoding="utf-8") as fh:
-                    captions.append(fh.read().strip())
-            except OSError:
-                continue
-    return captions
-
-
-def list_images(image_dir: str) -> list[str]:
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    if not os.path.isdir(image_dir):
-        return []
-    return [
-        os.path.join(image_dir, name)
-        for name in sorted(os.listdir(image_dir))
-        if os.path.splitext(name)[1].lower() in exts
-    ]
+    return ShapeResult(
+        category=best_category,
+        is_subject=best_category in SUBJECT_CATEGORIES,
+        confidence=confidence,
+        text_scores=scores,
+        image_diversity=diversity,
+        notes=notes,
+    )

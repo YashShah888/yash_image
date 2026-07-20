@@ -1,3 +1,4 @@
+import os
 from fastapi import Depends
 from fastapi import HTTPException
 from fastapi.routing import APIRouter
@@ -11,8 +12,8 @@ from core.models.tournament_models import TournamentType
 # TODO before submitting: replace with the pushed public repo URL and the
 # full 40-char commit SHA from `git rev-parse HEAD` on that commit (branch
 # names are rejected). See docs/miner.md "Submitting Your Training Repository".
-IMAGE_TOURNAMENT_REPO = "https://github.com/YashShah888/REPLACE_ME"
-IMAGE_TOURNAMENT_COMMIT_HASH = "0000000000000000000000000000000000000000"
+IMAGE_TOURNAMENT_REPO = os.environ.get("IMAGE_TOURNAMENT_REPO", "https://github.com/YashShah888/yash_image")
+IMAGE_TOURNAMENT_COMMIT_HASH = os.environ.get("IMAGE_TOURNAMENT_COMMIT_HASH", "")
 
 
 async def get_training_repo(task_type: TournamentType) -> TrainingRepoResponse:

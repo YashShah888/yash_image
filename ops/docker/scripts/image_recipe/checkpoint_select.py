@@ -1,29 +1,9 @@
-"""
-Measure-and-select checkpoint finalisation.
+"""Non-destructive checkpoint finalisation for the G.O.D uploader.
 
-The champion entry we studied predicts a single target step count from a
-hand-fit formula and trains blind to it — whatever checkpoint exists when
-training stops (by step count or by the wall-clock kill) is what gets
-uploaded, with no verification it's actually the best point reached. That is
-a predict-and-commit design.
-
-This module is the different-in-kind alternative: train to a generous step
-*ceiling* (recipe_table.py), let ai-toolkit periodically save checkpoints and
-(if config_builder.py's sample block was accepted) periodically render
-preview images from a small held-out slice of the real training images that
-never went into training. After the training subprocess ends — by finishing
-or by being stopped at the wall-clock reserve boundary — this module scores
-each retained checkpoint's preview images against the real held-out images
-using the same pixel L2 loss family the validator's own evaluator uses
-(mean squared error over normalised RGB arrays), and keeps only the
-best-scoring checkpoint's files in the output directory.
-
-This only ever *removes* extra checkpoints the base pipeline would already
-have discarded eventually (max_step_saves_to_keep already limits how many
-accumulate) — it never invents new files, and every failure mode below
-degrades to a true no-op that leaves the output directory exactly as
-untouched training would have left it. A wrong guess here must never be
-worse than not having this module at all.
+Preview generations are stochastic and are not aligned with training images,
+so raw RGB MSE is not a reliable checkpoint selector.  Challenger v2 trusts
+the recipe's planned final point, validates usable weights, and guarantees the
+canonical ``last.safetensors`` filename expected by diffusion evaluation.
 """
 
 from __future__ import annotations
@@ -34,120 +14,95 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-
-_STEP_RE = re.compile(r"(\d{3,})")
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-_WEIGHT_EXTS = {".safetensors", ".bin", ".pt"}
-
-
-def _extract_step(name: str) -> int | None:
-    matches = _STEP_RE.findall(name)
-    if not matches:
-        return None
-    return int(matches[-1])
+_WEIGHT_EXTS = {".safetensors", ".bin", ".pt", ".pth"}
+_STEP_RE = re.compile(r"(?:step|[-_])(\d{2,})(?:\D|$)", re.IGNORECASE)
+_CANONICAL_NAME = "last.safetensors"
 
 
-def _group_by_step(directory: Path, exts: set[str]) -> dict[int, list[Path]]:
-    groups: dict[int, list[Path]] = {}
-    if not directory.is_dir():
-        return groups
-    for entry in directory.iterdir():
-        if entry.is_dir():
-            continue
-        if entry.suffix.lower() not in exts:
-            continue
-        step = _extract_step(entry.stem)
-        if step is None:
-            continue
-        groups.setdefault(step, []).append(entry)
-    return groups
-
-
-def _l2_loss(a_path: Path, b_path: Path) -> float | None:
-    try:
-        import numpy as np
-        from PIL import Image
-    except ImportError:
-        return None
-    try:
-        with Image.open(a_path) as a, Image.open(b_path) as b:
-            a = a.convert("RGB")
-            b = b.convert("RGB")
-            if a.size != b.size:
-                b = b.resize(a.size)
-            arr_a = np.asarray(a, dtype=np.float64) / 255.0
-            arr_b = np.asarray(b, dtype=np.float64) / 255.0
-            return float(((arr_a - arr_b) ** 2).mean())
-    except Exception:
-        return None
-
-
-@dataclass
+@dataclass(frozen=True)
 class SelectionResult:
     chosen_step: int
     scores: dict[int, float]
     removed_steps: list[int]
+    weight_files: tuple[str, ...] = ()
+    canonical_path: str | None = None
+
+
+def _step(path: Path) -> int:
+    for value in (path.stem, path.parent.name):
+        match = _STEP_RE.search(value)
+        if match:
+            return int(match.group(1))
+    numbers = re.findall(r"\d+", path.stem)
+    return int(numbers[-1]) if numbers else 0
+
+
+def _candidate_weights(root: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in _WEIGHT_EXTS
+            and path.stat().st_size > 1024
+        ),
+        key=lambda path: (_step(path), path.stat().st_mtime_ns, path.stat().st_size),
+    )
+
+
+def _ensure_canonical(root: Path, weights: list[Path]) -> Path:
+    canonical = root / _CANONICAL_NAME
+    if canonical.is_file() and canonical.stat().st_size > 1024:
+        return canonical
+
+    safetensors = [path for path in weights if path.suffix.lower() == ".safetensors"]
+    if not safetensors:
+        raise RuntimeError(
+            f"weights exist below {root}, but no safetensors file can become {_CANONICAL_NAME}"
+        )
+    source = safetensors[-1]
+    if source.resolve() == canonical.resolve():
+        return canonical
+
+    temporary = root / f".{_CANONICAL_NAME}.tmp-{os.getpid()}"
+    try:
+        shutil.copy2(source, temporary)
+        if temporary.stat().st_size <= 1024:
+            raise RuntimeError(f"canonical checkpoint copy is unexpectedly small: {temporary}")
+        os.replace(temporary, canonical)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return canonical
+
+
+def validate_output(output_dir: str | Path) -> SelectionResult:
+    root = Path(output_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"expected output directory was not created: {root}")
+    weights = _candidate_weights(root)
+    if not weights:
+        raise RuntimeError(f"no non-empty model weight file found below {root}")
+
+    canonical = _ensure_canonical(root, weights)
+    weights = _candidate_weights(root)
+    newest = max(weights, key=lambda path: (_step(path), path.stat().st_mtime_ns))
+    return SelectionResult(
+        chosen_step=_step(newest),
+        scores={},
+        removed_steps=[],
+        weight_files=tuple(str(path) for path in weights),
+        canonical_path=str(canonical),
+    )
 
 
 def select_best(
     output_dir: str,
-    held_out_image_paths: list[str],
+    held_out_image_paths: list[str] | None = None,
     samples_subdir_name: str = "samples",
 ) -> SelectionResult | None:
-    """Best-effort. Returns None (and touches nothing) on any failure or
-    whenever there isn't enough information to make a confident choice."""
+    """Compatibility API: validate/canonicalize, never MSE-rank or delete."""
+    del held_out_image_paths, samples_subdir_name
     try:
-        out = Path(output_dir)
-        if not out.is_dir() or not held_out_image_paths:
-            return None
-
-        checkpoint_groups = _group_by_step(out, _WEIGHT_EXTS)
-        if len(checkpoint_groups) < 2:
-            return None  # nothing to choose between; leave as-is
-
-        samples_dir = out / samples_subdir_name
-        sample_groups = _group_by_step(samples_dir, _IMAGE_EXTS)
-        if not sample_groups:
-            return None  # sampling wasn't produced (schema mismatch etc.) -> no-op
-
-        held_out = [Path(p) for p in held_out_image_paths if os.path.exists(p)]
-        if not held_out:
-            return None
-
-        scores: dict[int, float] = {}
-        for step, sample_files in sample_groups.items():
-            if step not in checkpoint_groups:
-                continue  # a sample without a matching saved checkpoint is unusable
-            sample_files = sorted(sample_files)[: len(held_out)]
-            if not sample_files:
-                continue
-            pairwise = []
-            for real, generated in zip(held_out, sample_files):
-                loss = _l2_loss(real, generated)
-                if loss is not None:
-                    pairwise.append(loss)
-            if pairwise:
-                scores[step] = sum(pairwise) / len(pairwise)
-
-        if not scores:
-            return None  # couldn't score anything (e.g. PIL unavailable) -> no-op
-
-        best_step = min(scores, key=scores.get)
-
-        removed = []
-        for step, files in checkpoint_groups.items():
-            if step == best_step:
-                continue
-            for f in files:
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-            removed.append(step)
-
-        if samples_dir.is_dir():
-            shutil.rmtree(samples_dir, ignore_errors=True)
-
-        return SelectionResult(chosen_step=best_step, scores=scores, removed_steps=removed)
+        return validate_output(output_dir)
     except Exception:
         return None

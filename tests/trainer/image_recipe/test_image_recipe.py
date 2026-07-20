@@ -21,6 +21,7 @@ _SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+from image_recipe import caption  # noqa: E402
 from image_recipe import checkpoint_select  # noqa: E402
 from image_recipe import dataset_prep  # noqa: E402
 from image_recipe import recipe_table  # noqa: E402
@@ -38,29 +39,18 @@ CAPTION_CASES = {
 
 
 @pytest.mark.parametrize("expected,caption", CAPTION_CASES.items())
-def test_classify_from_captions(expected, caption):
-    category, confident = task_shape.classify_from_captions([caption])
-    assert category == expected
-    assert confident
+def test_classify_captions(expected, caption):
+    result = task_shape.classify([caption])
+    assert result.category == expected
+    assert result.confident_from_text
+    assert result.is_subject == (expected in task_shape.SUBJECT_CATEGORIES)
 
 
-def test_classify_from_captions_no_signal_falls_back():
-    category, confident = task_shape.classify_from_captions(["", "   "])
-    assert category == task_shape.FALLBACK_CATEGORY
-    assert not confident
-
-
-@pytest.mark.parametrize("category,expected_subject", [
-    ("person", True),
-    ("product", True),
-    ("style", False),
-    ("logo", False),
-    ("social", False),
-    ("design", False),
-    ("unknown-category", False),
-])
-def test_resolve_shape(category, expected_subject):
-    assert task_shape.resolve_shape(category) is expected_subject
+def test_classify_no_signal_falls_back_conservatively():
+    result = task_shape.classify(["", "   "])
+    assert result.category == "style"
+    assert not result.confident_from_text
+    assert result.notes
 
 
 @pytest.mark.parametrize("model_type", ["flux", "z-image", "qwen-image", "ideogram4", "krea2"])
@@ -89,7 +79,10 @@ def test_recipe_table_subject_gets_tighter_ceiling_than_style():
     assert subject.step_ceiling < style.step_ceiling
 
 
-def test_recipe_table_caption_dropout_only_when_template_supports_it():
+def test_recipe_table_caption_dropout_always_set_but_notes_unsupported_templates():
+    """v2 no longer skips caption dropout for templates that lack a native
+    key -- it injects the value into the shared ai-toolkit dataset schema
+    instead and leaves a note explaining why."""
     with_support = recipe_table.build_recipe(
         "flux", is_subject=False, category="style", category_confident=True,
         n_images=20, template_supports_caption_dropout=True,
@@ -99,60 +92,123 @@ def test_recipe_table_caption_dropout_only_when_template_supports_it():
         n_images=20, template_supports_caption_dropout=False,
     )
     assert with_support.caption_dropout_rate is not None
-    assert without_support.caption_dropout_rate is None
+    assert without_support.caption_dropout_rate is not None
+    assert any("injected into shared ai-toolkit dataset schema" in note for note in without_support.notes)
 
 
-def test_dataset_prep_holdout_split_keeps_images_and_captions_aligned():
+def test_conservative_dedup_removes_only_byte_identical_copies():
+    """v2 deliberately replaced perceptual near-duplicate removal with
+    exact-only dedup: tiny tournament datasets are data-starved, and pHash
+    deletion risked erasing legitimate near-duplicate logo/layout variants.
+    Only true byte-identical copies should be removed, keeping the copy with
+    the more informative caption."""
     with tempfile.TemporaryDirectory() as tmp:
-        image_dir = os.path.join(tmp, "images")
-        holdout_dir = os.path.join(tmp, "holdout")
-        os.makedirs(image_dir)
-        for i in range(10):
-            open(os.path.join(image_dir, f"img{i}.jpg"), "wb").close()
-            with open(os.path.join(image_dir, f"img{i}.txt"), "w") as fh:
+        with open(os.path.join(tmp, "a.jpg"), "wb") as fh:
+            fh.write(b"identical-bytes")
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("a much more descriptive caption")
+        with open(os.path.join(tmp, "a_dup.jpg"), "wb") as fh:
+            fh.write(b"identical-bytes")
+        with open(os.path.join(tmp, "a_dup.txt"), "w") as fh:
+            fh.write("short")
+        # Enough filler images to clear conservative_dedup's minimum_remaining floor.
+        for i in range(8):
+            with open(os.path.join(tmp, f"filler{i}.jpg"), "wb") as fh:
+                fh.write(f"filler-{i}".encode())
+            with open(os.path.join(tmp, f"filler{i}.txt"), "w") as fh:
+                fh.write(f"filler {i}")
+
+        result = dataset_prep.conservative_dedup(tmp)
+        remaining = sorted(os.listdir(tmp))
+        assert result.n_removed == 1
+        assert "a.jpg" in remaining and "a.txt" in remaining
+        assert "a_dup.jpg" not in remaining and "a_dup.txt" not in remaining
+
+
+def test_conservative_dedup_keeps_near_duplicates_that_are_not_byte_identical():
+    """A one-byte difference must survive: v2 intentionally does not run
+    perceptual/near-duplicate removal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "near1.jpg"), "wb") as fh:
+            fh.write(b"almost-identical-A")
+        with open(os.path.join(tmp, "near1.txt"), "w") as fh:
+            fh.write("near 1")
+        with open(os.path.join(tmp, "near2.jpg"), "wb") as fh:
+            fh.write(b"almost-identical-B")
+        with open(os.path.join(tmp, "near2.txt"), "w") as fh:
+            fh.write("near 2")
+        for i in range(8):
+            with open(os.path.join(tmp, f"filler{i}.jpg"), "wb") as fh:
+                fh.write(f"filler-{i}".encode())
+            with open(os.path.join(tmp, f"filler{i}.txt"), "w") as fh:
+                fh.write(f"filler {i}")
+
+        result = dataset_prep.conservative_dedup(tmp)
+        assert result.n_removed == 0
+        remaining = sorted(os.listdir(tmp))
+        assert "near1.jpg" in remaining and "near2.jpg" in remaining
+
+
+def test_conservative_dedup_disabled_below_minimum_remaining():
+    with tempfile.TemporaryDirectory() as tmp:
+        for i in range(3):
+            with open(os.path.join(tmp, f"img{i}.jpg"), "wb") as fh:
+                fh.write(b"same-bytes")
+            with open(os.path.join(tmp, f"img{i}.txt"), "w") as fh:
                 fh.write(f"caption {i}")
 
-        result = dataset_prep.holdout_split(image_dir, holdout_dir, min_remaining=4, max_holdout=3)
-        assert result.note is None
-        assert len(result.held_image_paths) == len(result.held_caption_paths) > 0
-        for img_path, cap_path in zip(result.held_image_paths, result.held_caption_paths):
-            assert os.path.exists(img_path)
-            assert os.path.exists(cap_path)
-            assert os.path.dirname(img_path) == holdout_dir
+        result = dataset_prep.conservative_dedup(tmp, minimum_remaining=6)
+        assert result.n_removed == 0
+        assert result.note == "small dataset: duplicate removal disabled"
 
 
-def test_dataset_prep_holdout_split_skips_when_dataset_too_small():
+def test_perceptual_dedup_alias_delegates_to_conservative_dedup():
+    """The prior entrypoint imports dataset_prep.perceptual_dedup by name;
+    v2 keeps that name as a compatibility alias for conservative_dedup."""
     with tempfile.TemporaryDirectory() as tmp:
-        image_dir = os.path.join(tmp, "images")
-        os.makedirs(image_dir)
-        for i in range(3):
-            open(os.path.join(image_dir, f"img{i}.jpg"), "wb").close()
-            open(os.path.join(image_dir, f"img{i}.txt"), "w").close()
+        for i in range(8):
+            with open(os.path.join(tmp, f"img{i}.jpg"), "wb") as fh:
+                fh.write(f"img-{i}".encode())
+            with open(os.path.join(tmp, f"img{i}.txt"), "w") as fh:
+                fh.write(f"caption {i}")
 
-        result = dataset_prep.holdout_split(image_dir, os.path.join(tmp, "holdout"), min_remaining=4)
-        assert result.held_image_paths == []
-        assert result.note is not None
+        result = dataset_prep.perceptual_dedup(tmp, hamming_threshold=8, thumb_threshold=20.0)
+        assert result.n_removed == 0
 
 
-def test_dedup_distinguishes_flat_color_images_from_true_near_duplicates():
-    """Regression test for a real bug found during development: phash alone
-    is nearly blind to flat/low-texture images (exactly the logo/social/
-    design categories this subnet covers) and would call distinct flat-color
-    images duplicates. dataset_prep.perceptual_dedup requires a second,
-    colour-thumbnail signal to agree before removing anything."""
+def test_caption_enrich_appends_real_image_attributes_for_visual_categories():
+    """Regression test: _image_attributes previously read PIL's ImageStat.Stat
+    via a `.std` attribute that does not exist (the real attribute is
+    `.stddev`), so it silently failed on every image via the broad except
+    clause and never appended orientation/palette/contrast text. Must
+    actually enrich style/logo/social/design captions with real signal."""
     pytest.importorskip("PIL")
-    pytest.importorskip("imagehash")
     from PIL import Image
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Six distinct flat colours -- must all survive.
-        for i in range(6):
-            color = (i * 40 % 255, (i * 80) % 255, (i * 120) % 255)
-            Image.new("RGB", (32, 32), color).save(os.path.join(tmp, f"img{i}.jpg"))
-            open(os.path.join(tmp, f"img{i}.txt"), "w").write(f"caption {i}")
+        Image.new("RGB", (512, 384), (200, 30, 30)).save(os.path.join(tmp, "img0.jpg"))
+        open(os.path.join(tmp, "img0.txt"), "w").close()
 
-        result = dataset_prep.perceptual_dedup(tmp)
-        assert result.n_removed == 0, "distinct flat-colour images were wrongly treated as duplicates"
+        stats = caption.enrich_directory(tmp, category="design", is_subject=False, trigger_word=None)
+        assert stats.failures == 0
+        text = open(os.path.join(tmp, "img0.txt")).read()
+        assert "composition" in text
+        assert "palette" in text
+        assert "contrast" in text
+
+
+def test_caption_enrich_stays_minimal_for_subject_categories():
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        Image.new("RGB", (256, 256), (10, 10, 10)).save(os.path.join(tmp, "img0.jpg"))
+        open(os.path.join(tmp, "img0.txt"), "w").write("a person standing")
+
+        caption.enrich_directory(tmp, category="person", is_subject=True, trigger_word="sks person")
+        text = open(os.path.join(tmp, "img0.txt")).read()
+        assert "composition" not in text and "palette" not in text
+        assert text.startswith("sks person")
 
 
 def test_safe_extract_rejects_path_traversal():
@@ -177,92 +233,30 @@ def test_safe_extract_allows_a_normal_archive():
         assert sorted(os.listdir(dest)) == ["img1.jpg", "img1.txt"]
 
 
-def test_dedup_keeps_the_sharper_image_in_a_near_duplicate_cluster():
-    """perceptual_dedup should keep the best-quality (sharpest) representative
-    of a near-duplicate cluster, not an arbitrary/first-encountered one."""
-    pytest.importorskip("PIL")
-    pytest.importorskip("imagehash")
-    from PIL import Image
-    from PIL import ImageFilter
-
+def test_checkpoint_select_canonicalizes_the_newest_weights_non_destructively():
+    """v2 removed the pixel-MSE preview scorer (stochastic diffusion previews
+    are not pixel-aligned with held-out images) in favor of trusting the
+    recipe's planned final point and guaranteeing the canonical
+    last.safetensors filename the diffusion evaluator expects. It must never
+    delete an existing checkpoint file."""
     with tempfile.TemporaryDirectory() as tmp:
-        sharp = Image.new("RGB", (64, 64))
-        px = sharp.load()
-        for x in range(64):
-            for y in range(64):
-                v = 255 if (x // 4 + y // 4) % 2 == 0 else 0
-                px[x, y] = (v, v, v)
-        sharp.save(os.path.join(tmp, "sharp.png"))
-        open(os.path.join(tmp, "sharp.txt"), "w").write("sharp version")
+        with open(os.path.join(tmp, "repo_000000250.safetensors"), "wb") as fh:
+            fh.write(b"0" * 2000)
+        with open(os.path.join(tmp, "repo_000000500.safetensors"), "wb") as fh:
+            fh.write(b"1" * 2000)
 
-        blurry = sharp.filter(ImageFilter.GaussianBlur(radius=2))
-        blurry.save(os.path.join(tmp, "blurry.png"))
-        open(os.path.join(tmp, "blurry.txt"), "w").write("blurry version")
-
-        for i in range(3):
-            Image.new("RGB", (64, 64), (i * 70, 255 - i * 70, 100)).save(os.path.join(tmp, f"filler{i}.png"))
-            open(os.path.join(tmp, f"filler{i}.txt"), "w").write(f"filler {i}")
-
-        result = dataset_prep.perceptual_dedup(tmp, hamming_threshold=8, thumb_threshold=20.0)
-        remaining = os.listdir(tmp)
-        assert result.n_removed == 1
-        assert "sharp.png" in remaining
-        assert "blurry.png" not in remaining
-
-    with tempfile.TemporaryDirectory() as tmp:
-        base = Image.new("RGB", (32, 32), (120, 60, 200))
-        base.save(os.path.join(tmp, "orig.jpg"))
-        open(os.path.join(tmp, "orig.txt"), "w").write("original")
-        # Near-identical copy (true duplicate).
-        base.save(os.path.join(tmp, "near_dup.jpg"))
-        open(os.path.join(tmp, "near_dup.txt"), "w").write("near dup")
-        # Well-separated distractors.
-        for i, color in enumerate([(0, 200, 50), (255, 255, 0), (10, 10, 10)]):
-            Image.new("RGB", (32, 32), color).save(os.path.join(tmp, f"other{i}.jpg"))
-            open(os.path.join(tmp, f"other{i}.txt"), "w").write(f"other {i}")
-
-        result = dataset_prep.perceptual_dedup(tmp)
-        assert result.n_removed == 1
-
-
-def test_checkpoint_select_no_op_when_only_one_checkpoint():
-    with tempfile.TemporaryDirectory() as tmp:
-        open(os.path.join(tmp, "repo_000000250.safetensors"), "w").close()
-        assert checkpoint_select.select_best(tmp, ["/nonexistent.jpg"]) is None
-
-
-def test_checkpoint_select_no_op_without_samples():
-    with tempfile.TemporaryDirectory() as tmp:
-        open(os.path.join(tmp, "repo_000000250.safetensors"), "w").close()
-        open(os.path.join(tmp, "repo_000000500.safetensors"), "w").close()
-        assert checkpoint_select.select_best(tmp, ["/nonexistent.jpg"]) is None
-
-
-def test_checkpoint_select_picks_the_closer_checkpoint_and_prunes_the_other():
-    pytest.importorskip("PIL")
-    pytest.importorskip("numpy")
-    from PIL import Image
-
-    with tempfile.TemporaryDirectory() as tmp:
-        samples_dir = os.path.join(tmp, "samples")
-        os.makedirs(samples_dir)
-
-        holdout_path = os.path.join(tmp, "holdout1.jpg")
-        Image.new("RGB", (64, 64), (255, 0, 0)).save(holdout_path)
-
-        # Checkpoint 250's sample is close to the real held-out image.
-        Image.new("RGB", (64, 64), (240, 10, 10)).save(os.path.join(samples_dir, "sample_000000250_0.jpg"))
-        open(os.path.join(tmp, "repo_000000250.safetensors"), "w").close()
-
-        # Checkpoint 500 has drifted away (simulates overfitting).
-        Image.new("RGB", (64, 64), (10, 10, 240)).save(os.path.join(samples_dir, "sample_000000500_0.jpg"))
-        open(os.path.join(tmp, "repo_000000500.safetensors"), "w").close()
-
-        result = checkpoint_select.select_best(tmp, [holdout_path])
+        result = checkpoint_select.select_best(tmp, None)
 
         assert result is not None
-        assert result.chosen_step == 250
+        assert result.chosen_step == 500
+        assert result.canonical_path is not None
+        assert os.path.isfile(result.canonical_path)
         remaining = sorted(os.listdir(tmp))
         assert "repo_000000250.safetensors" in remaining
-        assert "repo_000000500.safetensors" not in remaining
-        assert not os.path.isdir(samples_dir)
+        assert "repo_000000500.safetensors" in remaining
+        assert "last.safetensors" in remaining
+
+
+def test_checkpoint_select_returns_none_when_no_weights_exist():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert checkpoint_select.select_best(tmp, None) is None

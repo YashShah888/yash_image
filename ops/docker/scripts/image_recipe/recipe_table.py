@@ -1,98 +1,59 @@
-"""
-Hyperparameter policy for the ai-toolkit-driven image trainer.
-
-Every model type this repo enters (flux, z-image, qwen-image, ideogram4,
-krea2) runs through ai-toolkit's `diffusion_trainer`, so a single overlay
-shape works for all five: LoRA rank/alpha, a *step ceiling* (a safe upper
-bound, not a predicted exact stopping point — see checkpoint_select.py for
-why), and, where the base template already exposes the field, a caption
-dropout rate.
-
-Learning rate is deliberately left at the base template's proven value for
-v1: retuning LR without real tournament feedback is speculative, and a bad
-LR is one of the few mistakes checkpoint selection cannot rescue you from
-(an unstable run has no good checkpoint to pick). Rank and the step ceiling
-are safer, more reversible knobs to make adaptive first — LR tuning is
-explicitly deferred to Stage 2/3 once real results exist to calibrate
-against, per the plan.
-
-Every constant below is a first-principles starting point (small-dataset ->
-more capacity headroom is dangerous -> lower rank; style/format categories
-need more capacity to carry a transferable pattern -> higher rank), not a
-number reverse-engineered from another miner's results. They are expected to
-move once real tournament outcomes are available (Stage 2/3 of the plan).
-"""
+"""Adaptive hyperparameter policy for the five current image model families."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 
-SIZE_BUCKETS = ("xs", "s", "m", "l")
+@dataclass(frozen=True)
+class Recipe:
+    rank: int
+    alpha: int
+    steps: int
+    learning_rate: float
+    caption_dropout_rate: float | None
+    save_every: int
+    max_saves: int
+    bucket: str
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def step_ceiling(self) -> int:  # compatibility with v1 logging/tests
+        return self.steps
 
 
 def size_bucket(n_images: int) -> str:
     if n_images <= 8:
         return "xs"
-    if n_images <= 18:
+    if n_images <= 16:
         return "s"
-    if n_images <= 35:
+    if n_images <= 32:
         return "m"
     return "l"
 
 
-# rank (network.linear == network.linear_alpha) by (is_subject, bucket).
-# Subjects get less capacity (avoid memorising background clutter around the
-# one identity); style/format categories get more (need to carry a pattern
-# across diverse content).
-_RANK_SUBJECT = {"xs": 12, "s": 16, "m": 20, "l": 24}
-_RANK_STYLE = {"xs": 20, "s": 24, "m": 28, "l": 32}
-
-# Per-category capacity nudges layered on top of the shape-level rank, for
-# categories whose visual content has a distinct capacity need (sharp
-# typography/edges want more; a single clean product shot wants less). Only
-# applied when the category is confidently known.
-_CATEGORY_RANK_DELTA = {
-    "logo": 8,
-    "social": 8,
-    "design": 4,
-    "product": -4,
+_BASE_STEPS = {
+    "flux": 1650,
+    "z-image": 1750,
+    "qwen-image": 2350,
+    "ideogram4": 1850,
+    "krea2": 1850,
 }
 
-# Step CEILING per model type / bucket: a safe upper bound the training
-# subprocess is allowed to reach, not a target it is expected to hit exactly.
-# checkpoint_select.py decides, by measurement, which point along the way to
-# actually ship. Values start near each model's base-template step count and
-# taper down for larger datasets (more images per epoch already means more
-# gradient signal per step, so fewer total steps are needed to reach the
-# same number of "effective passes").
-_STEP_CEILING = {
-    "flux": {"xs": 1400, "s": 1800, "m": 2000, "l": 2000},
-    "z-image": {"xs": 1400, "s": 1800, "m": 2000, "l": 2000},
-    "qwen-image": {"xs": 1800, "s": 2400, "m": 3000, "l": 3000},
-    "ideogram4": {"xs": 1400, "s": 1800, "m": 2000, "l": 2000},
-    "krea2": {"xs": 1400, "s": 1800, "m": 2000, "l": 2000},
+_BASE_LR = {
+    "flux": 1.0e-4,
+    "z-image": 9.0e-5,
+    "qwen-image": 8.0e-5,
+    # The upstream Ideogram template uses 4e-4.  A moderated value converges
+    # materially faster than v1's 8e-5 without taking the full overfit risk.
+    "ideogram4": 2.0e-4,
+    "krea2": 9.0e-5,
 }
 
-# Subject tasks overfit faster and rarely need the full ceiling; give them a
-# materially tighter one so checkpoint_select has a realistic best-checkpoint
-# window to search, rather than searching mostly-overfit late checkpoints.
-_STEP_CEILING_SUBJECT_SCALE = 0.4
 
-# Caption dropout, only applied to templates whose datasets[0] already
-# defines the key (flux/ideogram4/krea2 do; z-image/qwen-image don't -- we
-# never introduce a config key a template doesn't already use).
-_CAPTION_DROPOUT_SUBJECT = 0.15
-_CAPTION_DROPOUT_STYLE = 0.05
-
-
-@dataclass
-class Recipe:
-    rank: int
-    step_ceiling: int
-    caption_dropout_rate: float | None
-    bucket: str
-    notes: list[str]
+def _round_to(value: float, quantum: int = 50) -> int:
+    return max(quantum, int(round(value / quantum) * quantum))
 
 
 def build_recipe(
@@ -102,32 +63,80 @@ def build_recipe(
     category_confident: bool,
     n_images: int,
     template_supports_caption_dropout: bool,
+    hours_to_complete: float = 1.5,
 ) -> Recipe:
-    mt = (model_type or "").lower().strip()
+    model_type = (model_type or "flux").strip().lower()
+    category = (category or "style").strip().lower()
     bucket = size_bucket(n_images)
-    notes = [f"bucket={bucket} n={n_images}"]
+    notes = [f"bucket={bucket}; images={n_images}"]
 
-    base_rank = (_RANK_SUBJECT if is_subject else _RANK_STYLE)[bucket]
-    rank = base_rank
-    cat = (category or "").lower().strip()
-    if category_confident and cat in _CATEGORY_RANK_DELTA:
-        rank = max(8, base_rank + _CATEGORY_RANK_DELTA[cat])
-        notes.append(f"category delta applied ({cat}: {_CATEGORY_RANK_DELTA[cat]:+d})")
-
-    ceiling_table = _STEP_CEILING.get(mt, _STEP_CEILING["flux"])
-    ceiling = ceiling_table[bucket]
+    # Rank is capacity. Identity tasks need less capacity to avoid learning
+    # backgrounds; graphic/style tasks need more to carry structure and text.
     if is_subject:
-        ceiling = max(200, round(ceiling * _STEP_CEILING_SUBJECT_SCALE))
-        notes.append("subject step ceiling scaled down")
+        rank = {"xs": 16, "s": 20, "m": 24, "l": 24}[bucket]
+    else:
+        rank = {"xs": 24, "s": 32, "m": 40, "l": 48}[bucket]
+    if category_confident and category in {"logo", "social", "design"}:
+        rank = min(64, rank + 8)
+        notes.append("graphic-format capacity boost")
+    if category_confident and category == "product":
+        rank = max(16, rank - 4)
+        notes.append("product overfit guard")
 
-    dropout = None
-    if template_supports_caption_dropout:
-        dropout = _CAPTION_DROPOUT_SUBJECT if is_subject else _CAPTION_DROPOUT_STYLE
+    base_steps = _BASE_STEPS.get(model_type, _BASE_STEPS["flux"])
+    # Approximate effective epochs.  Very small sets need more optimizer steps,
+    # while large sets obtain more unique signal per step.
+    data_scale = min(1.28, max(0.72, math.sqrt(16.0 / max(n_images, 4))))
+    shape_scale = 0.68 if is_subject else 1.0
+    category_scale = 1.0
+    if category_confident and category in {"logo", "social", "design"}:
+        category_scale = 1.10
+    elif category_confident and category == "product":
+        category_scale = 0.88
 
+    # The wall-clock watchdog remains authoritative.  This only avoids asking
+    # for an impossible number of steps when a short task budget is supplied.
+    time_scale = min(1.20, max(0.65, max(hours_to_complete, 0.25) / 1.5))
+    steps = _round_to(base_steps * data_scale * shape_scale * category_scale * time_scale)
+    steps = min(3200, max(550 if is_subject else 900, steps))
+
+    lr = _BASE_LR.get(model_type, _BASE_LR["flux"])
+    if is_subject:
+        lr *= 1.08
+    elif category in {"style", "design"}:
+        lr *= 0.90
+    if n_images <= 8:
+        lr *= 0.90
+    lr = float(f"{lr:.8g}")
+
+    # The evaluator mixes prompt-guided and empty-prompt img2img branches.
+    # Moderate caption dropout gives the LoRA unconditional reconstruction
+    # practice without discarding prompt alignment.  The same ai-toolkit
+    # dataset schema is shared by all five architectures, so we intentionally
+    # set this for Z/Qwen as well as templates that already declare the key.
+    if is_subject:
+        dropout = 0.18
+    elif category == "product":
+        dropout = 0.16
+    elif category in {"logo", "social", "design"}:
+        dropout = 0.08
+    else:
+        dropout = 0.12
+    if model_type in {"z-image", "qwen-image"}:
+        dropout = min(0.22, dropout + 0.03)
+    if not template_supports_caption_dropout:
+        notes.append("caption dropout injected into shared ai-toolkit dataset schema")
+
+    save_every = max(150, _round_to(steps / 4.0, 50))
+    save_every = min(save_every, 500)
     return Recipe(
         rank=rank,
-        step_ceiling=ceiling,
+        alpha=rank,
+        steps=steps,
+        learning_rate=lr,
         caption_dropout_rate=dropout,
+        save_every=save_every,
+        max_saves=4,
         bucket=bucket,
         notes=notes,
     )

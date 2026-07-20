@@ -19,6 +19,7 @@ Usage:
 import argparse
 import asyncio
 
+from core.models.tournament_models import TournamentType
 from validator.infrastructure.repo_dedup import run_pairwise_dedup
 from validator.tournament.models import RepoRef
 
@@ -31,6 +32,12 @@ async def main() -> None:
     parser.add_argument("--hash-b", help="commit hash to check out for repo B (default: HEAD)")
     parser.add_argument("--token-a", help="GitHub token for repo A (if private)")
     parser.add_argument("--token-b", help="GitHub token for repo B (if private)")
+    parser.add_argument(
+        "--tournament-type",
+        choices=[t.value for t in TournamentType],
+        default=TournamentType.IMAGE.value,
+        help="scopes the T2 judge to the matching live training path (default: image)",
+    )
     parser.add_argument("--out", help="also write the verdict to this path")
     args = parser.parse_args()
 
@@ -44,7 +51,7 @@ async def main() -> None:
     print("Running T0/T1/T2 de-dup check (this calls Claude and may take a minute)...\n")
 
     # No boss in a standalone check — we just want the raw pairwise verdict.
-    result = await run_pairwise_dedup(repos, boss_hotkey=None)
+    result = await run_pairwise_dedup(repos, TournamentType(args.tournament_type), boss_hotkey=None)
 
     unclonable = set(result.unclonable_hotkeys)
     if unclonable:

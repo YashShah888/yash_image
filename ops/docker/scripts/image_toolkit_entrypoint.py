@@ -3,46 +3,34 @@ import argparse
 import os
 import shutil
 import subprocess
-import zipfile
+import sys
+import time
 from pathlib import Path
 
-import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from image_recipe import caption
+from image_recipe import checkpoint_select
+from image_recipe import config_builder
+from image_recipe import dataset_prep
 
 
 CACHE_ROOT = Path("/cache")
-CONFIG_TEMPLATE_ROOT = Path("/workspace/core/training_templates")
-CONFIG_OUTPUT_ROOT = Path("/dataset/configs")
 DATASET_ZIP_ROOT = CACHE_ROOT / "datasets"
 IMAGE_DATASET_ROOT = Path("/dataset/images")
+HOLDOUT_ROOT = Path("/dataset/holdout")
+CONFIG_OUTPUT_ROOT = Path("/dataset/configs")
 CHECKPOINTS_ROOT = Path("/app/checkpoints")
 AI_TOOLKIT_ROOT = Path("/app/ai-toolkit")
 
-TEMPLATE_BY_MODEL_TYPE = {
-    "flux": "base_diffusion_flux.yaml",
-    "z-image": "base_diffusion_zimage.yaml",
-    "qwen-image": "base_diffusion_qwen_image.yaml",
-    "ideogram4": "base_diffusion_ideogram4.yaml",
-    "krea2": "base_diffusion_krea2.yaml",
-}
-IDEOGRAM4_TEXT_ENCODER_CACHE = CACHE_ROOT / "hf_cache" / "Qwen--Qwen3-VL-8B-Instruct"
-KREA2_TEXT_ENCODER_CACHE = CACHE_ROOT / "hf_cache" / "Qwen--Qwen3-VL-4B-Instruct"
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task-id", required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--dataset-zip", required=True)
-    parser.add_argument("--model-type", required=True, choices=sorted(TEMPLATE_BY_MODEL_TYPE))
-    parser.add_argument("--expected-repo-name", required=True)
-    parser.add_argument("--hours-to-complete", required=True)
-    parser.add_argument("--trigger-word")
-    return parser.parse_args()
-
-
-def cached_model_path(model: str) -> Path:
-    cache_name = model.replace("/", "--")
-    return CACHE_ROOT / "models" / cache_name
+# Fraction (and cap) of hours_to_complete reserved so the training subprocess
+# is stopped early enough to leave time for checkpoint selection and the
+# platform's own upload step. Selection itself only reads already-generated
+# sample images (cheap), so this reserve is small.
+RESERVE_FRACTION = 0.08
+RESERVE_MIN_MINUTES = 2
+RESERVE_MAX_MINUTES = 12
 
 
 def prepare_dataset(task_id: str) -> Path:
@@ -59,8 +47,7 @@ def prepare_dataset(task_id: str) -> Path:
         shutil.rmtree(extract_root)
     extract_root.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(extract_root)
+    dataset_prep.safe_extract(str(zip_path), str(extract_root))
 
     supported_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".txt"}
     copied = 0
@@ -77,68 +64,125 @@ def prepare_dataset(task_id: str) -> Path:
     return IMAGE_DATASET_ROOT
 
 
-def prepare_config(args: argparse.Namespace, dataset_path: Path) -> Path:
-    template_path = CONFIG_TEMPLATE_ROOT / TEMPLATE_BY_MODEL_TYPE[args.model_type]
-    if not template_path.exists():
-        raise FileNotFoundError(f"Missing ai-toolkit template for {args.model_type}: {template_path}")
+def training_timeout_seconds(hours_to_complete: float) -> float:
+    total_minutes = max(1.0, hours_to_complete * 60.0)
+    reserve = min(RESERVE_MAX_MINUTES, max(RESERVE_MIN_MINUTES, total_minutes * RESERVE_FRACTION))
+    return max(60.0, (total_minutes - reserve) * 60.0)
 
-    with template_path.open() as file:
-        config = yaml.safe_load(file)
 
-    config_body = config.setdefault("config", {})
-    config_body["name"] = args.expected_repo_name
+def run_training(config_path: Path, timeout_seconds: float) -> None:
+    print(f"Starting training with config: {config_path} (timeout={timeout_seconds:.0f}s)", flush=True)
+    process = subprocess.Popen(
+        ["python3", "run.py", str(config_path)],
+        cwd=AI_TOOLKIT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    start = time.monotonic()
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            if time.monotonic() - start > timeout_seconds:
+                print("[trainer] time-budget reserve reached; stopping training", flush=True)
+                process.terminate()
+                break
+        return_code = process.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        print("[trainer] training did not exit after terminate; killing", flush=True)
+        process.kill()
+        return_code = process.wait()
 
-    process = config_body.setdefault("process", [{}])[0]
-    process["training_folder"] = str(CHECKPOINTS_ROOT / args.task_id)
-    process["trigger_word"] = args.trigger_word
-
-    datasets = process.setdefault("datasets", [{}])
-    datasets[0]["folder_path"] = str(dataset_path)
-
-    model_config = process.setdefault("model", {})
-    model_path = cached_model_path(args.model)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Expected cached base model at {model_path}")
-    # Trainer container has no internet; ai-toolkit must load every component from
-    # the local cache dir. Its ideogram4 loader uses the local branch when
-    # <name_or_path>/<subfolder> exists, so point it at the downloaded snapshot.
-    model_config["name_or_path"] = str(model_path)
-
-    if args.model_type == "ideogram4":
-        text_encoder_path = IDEOGRAM4_TEXT_ENCODER_CACHE
-        if not text_encoder_path.exists():
-            raise FileNotFoundError(
-                f"Expected cached Ideogram 4 text encoder at {text_encoder_path}"
-            )
-        model_kwargs = model_config.setdefault("model_kwargs", {})
-        model_kwargs["text_encoder_path"] = str(text_encoder_path)
-
-    elif args.model_type == "krea2":
-        text_encoder_path = KREA2_TEXT_ENCODER_CACHE
-        if not text_encoder_path.exists():
-            raise FileNotFoundError(
-                f"Expected cached Krea 2 text encoder at {text_encoder_path}"
-            )
-        vae_path = model_path / "vae"
-        if not vae_path.exists():
-            raise FileNotFoundError(f"Expected cached Krea 2 VAE at {vae_path}")
-        model_kwargs = model_config.setdefault("model_kwargs", {})
-        model_kwargs["text_encoder_path"] = str(text_encoder_path)
-        # Krea2Model appends the "vae" subfolder when loading the VAE.
-        model_kwargs["vae_path"] = str(model_path)
-
-    CONFIG_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    output_path = CONFIG_OUTPUT_ROOT / f"{args.task_id}.yaml"
-    with output_path.open("w") as file:
-        yaml.safe_dump(config, file, sort_keys=False)
-    return output_path
+    if return_code not in (0, None) and return_code < 0:
+        # Negative return code means the process was terminated by a signal
+        # (our own reserve-boundary terminate/kill) -- treat as an intentional
+        # stop, not a failure, as long as at least one checkpoint exists.
+        print(f"[trainer] training subprocess stopped by signal {return_code} (reserve boundary)", flush=True)
+        return
+    if return_code != 0:
+        raise RuntimeError(f"Training subprocess failed with exit code {return_code}")
+    print("Training subprocess completed successfully.", flush=True)
 
 
 def main() -> None:
-    args = parse_args()
-    dataset_path = prepare_dataset(args.task_id)
-    config_path = prepare_config(args, dataset_path)
-    subprocess.run(["python3", "run.py", str(config_path)], cwd=AI_TOOLKIT_ROOT, check=True)
+    print("---STARTING IMAGE TRAINING SCRIPT---", flush=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--dataset-zip", required=True)
+    parser.add_argument("--model-type", required=True, choices=sorted(config_builder.TEMPLATE_BY_MODEL_TYPE))
+    parser.add_argument("--expected-repo-name", required=True)
+    parser.add_argument("--hours-to-complete", required=True, type=float)
+    parser.add_argument("--trigger-word")
+    args = parser.parse_args()
+
+    dataset_dir = prepare_dataset(args.task_id)
+
+    dedup = dataset_prep.perceptual_dedup(str(dataset_dir))
+    if dedup.n_removed:
+        print(f"[dedup] removed {dedup.n_removed} near-duplicate images "
+              f"({dedup.n_before}->{dedup.n_after}, dup_rate={dedup.dup_rate})", flush=True)
+    if dedup.note:
+        print(f"[dedup] {dedup.note}", flush=True)
+
+    holdout_dir = HOLDOUT_ROOT / args.task_id
+    holdout = dataset_prep.holdout_split(str(dataset_dir), str(holdout_dir))
+    if holdout.note:
+        print(f"[holdout] {holdout.note}", flush=True)
+    else:
+        print(f"[holdout] held out {len(holdout.held_image_paths)} images for checkpoint selection", flush=True)
+
+    if args.trigger_word:
+        caption.apply_trigger_to_dir(str(dataset_dir), args.trigger_word)
+        caption.apply_trigger_to_dir(str(holdout_dir), args.trigger_word)
+
+    # Read captions in the same order as holdout.held_image_paths (not a
+    # re-sorted directory listing) so the Nth prompt handed to ai-toolkit's
+    # sampler lines up with the Nth held-out image checkpoint_select compares
+    # generated samples against.
+    held_out_captions = []
+    for cap_path in holdout.held_caption_paths:
+        try:
+            with open(cap_path, encoding="utf-8") as fh:
+                held_out_captions.append(fh.read().strip())
+        except OSError:
+            held_out_captions.append("")
+
+    checkpoints_dir = CHECKPOINTS_ROOT / args.task_id
+    config, recipe, shape = config_builder.build_config(
+        task_id=args.task_id,
+        model=args.model,
+        model_type=args.model_type,
+        expected_repo_name=args.expected_repo_name,
+        dataset_path=dataset_dir,
+        checkpoints_root=checkpoints_dir,
+        trigger_word=args.trigger_word,
+        held_out_captions=held_out_captions,
+        enable_sampling=bool(holdout.held_image_paths),
+    )
+    print(f"[recipe] shape={shape.category} subject={shape.is_subject} "
+          f"confident={shape.confident_from_text} image_signal={shape.image_signal_used} "
+          f"rank={recipe.rank} step_ceiling={recipe.step_ceiling} "
+          f"caption_dropout={recipe.caption_dropout_rate}", flush=True)
+    for note in shape.notes + recipe.notes:
+        print(f"[recipe] {note}", flush=True)
+
+    config_path = CONFIG_OUTPUT_ROOT / f"{args.task_id}.yaml"
+    config_builder.save_config(config, config_path)
+    print(f"Created ai-toolkit config at {config_path}", flush=True)
+
+    timeout_seconds = training_timeout_seconds(args.hours_to_complete)
+    run_training(config_path, timeout_seconds)
+
+    output_dir = checkpoints_dir / args.expected_repo_name
+    result = checkpoint_select.select_best(str(output_dir), holdout.held_image_paths)
+    if result:
+        print(f"[checkpoint_select] chose step {result.chosen_step} "
+              f"(scores={result.scores}, removed_steps={result.removed_steps})", flush=True)
+    else:
+        print("[checkpoint_select] no selection made; leaving trainer's own output as-is", flush=True)
 
 
 if __name__ == "__main__":

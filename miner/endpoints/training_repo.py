@@ -1,4 +1,5 @@
 from fastapi import Depends
+from fastapi import HTTPException
 from fastapi.routing import APIRouter
 from fiber.miner.dependencies import blacklist_low_stake
 from fiber.miner.dependencies import verify_get_request
@@ -7,11 +8,24 @@ from core.models.payload_models import TrainingRepoResponse
 from core.models.tournament_models import TournamentType
 
 
+# TODO before submitting: replace with the pushed public repo URL and the
+# full 40-char commit SHA from `git rev-parse HEAD` on that commit (branch
+# names are rejected). See docs/miner.md "Submitting Your Training Repository".
+IMAGE_TOURNAMENT_REPO = "https://github.com/YashShah888/REPLACE_ME"
+IMAGE_TOURNAMENT_COMMIT_HASH = "0000000000000000000000000000000000000000"
+
+
 async def get_training_repo(task_type: TournamentType) -> TrainingRepoResponse:
+    if task_type != TournamentType.IMAGE:
+        # We only enter the Image Tournament; a 404 here tells the validator
+        # not to register us for text/environment tournaments instead of
+        # submitting untested code (and paying an entry fee) for those.
+        raise HTTPException(status_code=404, detail=f"Not participating in {task_type.value} tournaments")
+
     return TrainingRepoResponse(
-        github_repo="https://github.com/rayonlabs/G.O.D",
-        commit_hash="5f161f642cd578b829e72dedd8444a491b9bbca3",
-        github_token=None,  # Optional, only if the repository is private. Leave as None if not using a private repository.
+        github_repo=IMAGE_TOURNAMENT_REPO,
+        commit_hash=IMAGE_TOURNAMENT_COMMIT_HASH,
+        github_token=None,
         requested_datasets=None,
     )
 
